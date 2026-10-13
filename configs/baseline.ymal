@@ -1,0 +1,12 @@
+dataset:
+  root: data/nuscenes
+  image_size: [320, 576]
+
+model:
+  num_cameras: 6
+
+  voxel_grid:
+    x_range: [-40.0, 40.0]
+    y_range: [-40.0, 40.0]
+    z_range: [-3.0, 9.0]
+    shape: [80, 80, 12]

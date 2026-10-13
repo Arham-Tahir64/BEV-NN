@@ -13,24 +13,46 @@ cd C:\Users\Arham\Desktop\BEV-NN
 .\.venv\Scripts\python.exe load_nuscenes.py
 ```
 
-The script loads all metadata and reads the first sample's front camera image,
-LiDAR point cloud, and annotations. It prints their shapes and file paths.
+By default, the script streams all six camera views through every scene in the
+mini dataset. It includes intermediate camera frames from `sweeps/`, aligns views
+to the nearest front-camera timestamp, and paces playback using recorded timestamps.
+Scenes play in order of start time; gaps between separate scenes are omitted.
+Images are decoded and resized as playback advances, so video is not preloaded.
+Playback can run slower on machines that cannot decode six images fast enough.
+
+Use the buttons or Space to pause/play. Left/right arrows step one frame.
+Choose a speed in the window, or pass `--speed`. Playback stops at the end;
+`--loop` repeats it. Close the window to exit.
 
 ```powershell
-.\.venv\Scripts\python.exe load_nuscenes.py --sample-index 10 --camera CAM_BACK
+.\.venv\Scripts\python.exe load_nuscenes.py --scene scene-0061
+.\.venv\Scripts\python.exe load_nuscenes.py --speed 2 --loop
+.\.venv\Scripts\python.exe load_nuscenes.py --single-frame --sample-index 10
 .\.venv\Scripts\python.exe load_nuscenes.py --dataroot D:\datasets\nuscenes --version v1.0-trainval
+```
+
+`--single-frame`, `--no-show`, and `--save-camera-grid` use the sample-based
+loader. `--sample-index` and `--camera` apply to that mode. Streaming uses
+`--scene` to select a scene, and starts at its first recorded camera frame.
+
+Save the camera grid without opening a window:
+
+```powershell
+.\.venv\Scripts\python.exe load_nuscenes.py --no-show --save-camera-grid camera_frames.png
 ```
 
 ## Use in Python
 
 ```python
-from load_nuscenes import load_nuscenes, load_sample
+from load_nuscenes import load_nuscenes, load_sample, show_camera_frames
 
 nusc = load_nuscenes()
 item = load_sample(nusc, sample_index=0)
 rgb = item["image"]             # H x W x 3 uint8 RGB array
 points = item["lidar_points"]   # N x 4 float32: x, y, z, intensity
 annotations = item["annotations"]
+all_camera_images = item["images"]  # Camera name -> RGB array
+show_camera_frames(item)
 ```
 
 LiDAR points are in the LiDAR sensor frame. Annotation positions are in the
