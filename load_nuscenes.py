@@ -7,84 +7,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from nuscenes.nuscenes import NuScenes
-
-DEFAULT_DATAROOT = Path(__file__).resolve().parent / "data" / "nuscenes"
-CAMERAS = (
-    "CAM_FRONT", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT",
-    "CAM_BACK", "CAM_BACK_LEFT", "CAM_BACK_RIGHT",
-)
-
-
-def load_nuscenes(
-    dataroot: str | Path = DEFAULT_DATAROOT,
-    version: str = "v1.0-mini",
-    verbose: bool = True,
-) -> NuScenes:
-    """Load the official devkit database; dataroot contains samples and metadata."""
-    root = Path(dataroot).expanduser().resolve()
-    if not (root / version / "scene.json").is_file():
-        raise FileNotFoundError(
-            f"Missing nuScenes metadata: {root / version / 'scene.json'}. "
-            "Extract the dataset into dataroot, so it contains the version, "
-            "samples, sweeps, and maps folders."
-        )
-    from nuscenes.nuscenes import NuScenes
-
-    return NuScenes(version=version, dataroot=str(root), verbose=verbose)
-
-
-def load_sample(
-    nusc: NuScenes,
-    sample_index: int = 0,
-    camera: str = "CAM_FRONT",
-) -> dict:
-    """Read one keyframe's six RGB images, raw LiDAR points, and 3D annotations.
-
-    images maps each camera name to a uint8 (height, width, 3) RGB array.
-    image retains the selected camera for single-camera callers.
-    lidar_points is a float32 array with shape (N, 4): x, y, z, intensity.
-    LiDAR coordinates and annotations remain in their original sensor/global
-    frames respectively; no projection or coordinate transformation is applied.
-    """
-    if not 0 <= sample_index < len(nusc.sample):
-        raise IndexError(f"sample_index must be between 0 and {len(nusc.sample) - 1}.")
-    if camera not in CAMERAS:
-        raise ValueError(f"Unknown camera {camera!r}; choose one of {CAMERAS}.")
-
-    import numpy as np
-    from PIL import Image
-    from nuscenes.utils.data_classes import LidarPointCloud
-
-    sample = nusc.sample[sample_index]
-    image_paths = {
-        channel: Path(nusc.get_sample_data_path(sample["data"][channel]))
-        for channel in CAMERAS
-    }
-    images = {}
-    for channel, path in image_paths.items():
-        with Image.open(path) as image:
-            images[channel] = np.array(image.convert("RGB"))
-    image_path = image_paths[camera]
-    rgb = images[camera]
-    lidar_path = Path(nusc.get_sample_data_path(sample["data"]["LIDAR_TOP"]))
-    lidar = LidarPointCloud.from_file(str(lidar_path)).points.T.copy()
-    annotations = [nusc.get("sample_annotation", token) for token in sample["anns"]]
-
-    return {
-        "sample": sample,
-        "scene": nusc.get("scene", sample["scene_token"]),
-        "image": rgb,
-        "images": images,
-        "image_paths": image_paths,
-        "lidar_points": lidar,
-        "annotations": annotations,
-        "image_path": image_path,
-        "lidar_path": lidar_path,
-    }
+from data.nuscenes_dataset import CAMERAS, DEFAULT_DATAROOT, load_nuscenes, load_sample
 
 
 def show_camera_frames(item: dict, save_path: str | Path | None = None, show: bool = True):
@@ -123,7 +46,11 @@ def main() -> None:
     parser.add_argument("--scene", help="Stream only this scene name, e.g. scene-0061.")
     parser.add_argument("--speed", type=float, default=1.0, help="Playback speed multiplier (default: 1).")
     parser.add_argument("--loop", action="store_true", help="Repeat video after the final scene.")
+    parser.add_argument("--occupancy-root", type=Path,
+                        help="Occ3D gts folder; attach labels in sample mode (--no-show or --single-frame).")
     args = parser.parse_args()
+    if args.occupancy_root is not None and not (args.single_frame or args.no_show or args.save_camera_grid):
+        parser.error("--occupancy-root requires sample mode: --single-frame or --no-show.")
 
     try:
         nusc = load_nuscenes(args.dataroot, args.version)
@@ -131,7 +58,7 @@ def main() -> None:
             from camera_stream import stream_camera_frames
             stream_camera_frames(nusc, scene_name=args.scene, speed=args.speed, loop=args.loop)
             return
-        item = load_sample(nusc, args.sample_index, args.camera)
+        item = load_sample(nusc, args.sample_index, args.camera, occupancy_root=args.occupancy_root)
     except ImportError as exc:
         parser.exit(1, f"Missing dependency: {exc}. Run: python -m pip install -r requirements.txt\n")
     except (FileNotFoundError, IndexError, ValueError) as exc:
@@ -141,11 +68,13 @@ def main() -> None:
     print(f"Scene: {item['scene']['name']}")
     print(f"Sample token: {item['sample']['token']}")
     print(f"Camera image: {item['image'].shape} ({item['image'].dtype})")
-    print(f"LiDAR points: {item['lidar_points'].shape} ({item['lidar_points'].dtype})")
     print(f"Annotations: {len(item['annotations'])}")
     print(f"Image file: {item['image_path']}")
-    print(f"LiDAR file: {item['lidar_path']}")
     print(f"Camera views loaded: {', '.join(item['images'])}")
+    if "occupancy" in item:
+        occupancy = item["occupancy"]
+        print(f"Voxel labels: {occupancy['semantics'].shape} ({occupancy['semantics'].dtype})")
+        print(f"Camera-visible voxels: {occupancy['mask_camera'].sum()}")
     if not args.no_show or args.save_camera_grid:
         show_camera_frames(item, save_path=args.save_camera_grid, show=not args.no_show)
 
