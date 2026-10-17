@@ -80,13 +80,16 @@ def read_camera_images(nusc, frame: dict, size: tuple[int, int]):
 
 
 class CameraPlayer:
-    def __init__(self, root, nusc, frames: list[dict], speed: float = 1.0, loop: bool = False):
+    def __init__(self, root, nusc, frames: list[dict], speed: float = 1.0, loop: bool = False,
+                 occupancy_root: str | Path | None = None):
         import tkinter as tk
         from tkinter import ttk
 
         self.root, self.nusc, self.frames = root, nusc, frames
         self.loop, self.index, self.playing, self.timer = loop, 0, False, None
         self.photos = {}
+        self.occupancy_root = occupancy_root
+        self.show_voxels = tk.BooleanVar(value=occupancy_root is not None)
         root.title("nuScenes - six-camera video")
         width = min(480, max(240, (root.winfo_screenwidth() - 100) // 3))
         self.image_size = (width, width * 9 // 16)
@@ -116,6 +119,17 @@ class CameraPlayer:
         self.speed = tk.StringVar(value=f"{speed:g}")
         ttk.Combobox(controls, textvariable=self.speed, values=("0.25", "0.5", "1", "2", "4"),
                      state="readonly", width=6).pack(side="left")
+        if occupancy_root is not None:
+            ttk.Checkbutton(controls, text="GT voxel centres", variable=self.show_voxels,
+                            command=self.draw).pack(side="left", padx=12)
+            from data.voxel_projection import LEGEND, PALETTE
+            legend = tk.Canvas(root, height=48, highlightthickness=0, bg="#171d23")
+            legend.pack(fill="x", padx=8)
+            for i, (name, class_id) in enumerate(LEGEND):
+                x, y = 12 + (i % 5) * (self.image_size[0] * 3 // 5), 12 + (i // 5) * 22
+                colour = "#" + "".join(f"{int(value):02x}" for value in PALETTE[class_id])
+                legend.create_oval(x, y-4, x+8, y+4, fill=colour, outline="")
+                legend.create_text(x+14, y, text=name, fill="white", anchor="w")
         self.status = tk.StringVar()
         ttk.Label(root, textvariable=self.status, padding=8).pack(fill="x")
         root.bind("<space>", lambda event: self.toggle())
@@ -129,6 +143,9 @@ class CameraPlayer:
 
         frame = self.frames[self.index]
         images = read_camera_images(self.nusc, frame, self.image_size)
+        if self.occupancy_root is not None and self.show_voxels.get():
+            from data.voxel_projection import overlay_camera_images
+            images = overlay_camera_images(self.nusc, frame, images, self.occupancy_root)
         for channel, image in images.items():
             self.photos[channel] = ImageTk.PhotoImage(image, master=self.root)
             self.labels[channel].configure(image=self.photos[channel])
@@ -136,6 +153,7 @@ class CameraPlayer:
         self.status.set(
             f"{frame['scene']} | {elapsed:.2f}s | Scene frame {frame['scene_frame']}/{frame['scene_frames']}"
             f" | Overall {self.index + 1}/{len(self.frames)} | Space: pause/play | Arrows: step"
+            + (" | GT keyframes" if self.occupancy_root is not None else "")
         )
 
     def pause(self):
@@ -205,18 +223,22 @@ class CameraPlayer:
         self.root.destroy()
 
 
-def stream_camera_frames(nusc, scene_name=None, speed=1.0, loop=False):
+def stream_camera_frames(nusc, scene_name=None, speed=1.0, loop=False, occupancy_root=None):
     import math
     import tkinter as tk
 
     if not math.isfinite(speed) or speed <= 0:
         raise ValueError("Playback speed must be a positive finite number.")
-    frames = build_camera_timeline(nusc, scene_name)
+    if occupancy_root is not None:
+        from data.voxel_projection import build_occupancy_timeline
+        frames = build_occupancy_timeline(nusc, scene_name, occupancy_root)
+    else:
+        frames = build_camera_timeline(nusc, scene_name)
     print(f"Streaming {len(frames)} camera frames across {len({f['scene'] for f in frames})} scenes.")
     print("Space: pause/play. Left/right arrows: step. Close the window to stop.")
     root = tk.Tk()
     try:
-        player = CameraPlayer(root, nusc, frames, speed, loop)
+        player = CameraPlayer(root, nusc, frames, speed, loop, occupancy_root)
         player.toggle()
         root.mainloop()
     finally:
