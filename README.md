@@ -178,3 +178,54 @@ Python 3.12 is used for this project.
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
+
+## PyTorch training batches
+
+Install CUDA-enabled PyTorch for the RTX 4060 before installing the remaining
+requirements (CPU-only environments can use the standard requirements command):
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe check_dataset.py --workers 2
+```
+
+The check saves outputs/training_projection.png and a JSON validation report.
+It verifies official disjoint mini scene splits, a real batch, resized camera
+projection consistency, and CUDA transfer when available.
+
+```python
+from data import NuScenesOccupancyDataset, make_dataloader
+
+def main():
+    train = NuScenesOccupancyDataset(split="train", image_size=(320, 576))
+    loader = make_dataloader(train, batch_size=2, num_workers=2)
+    batch = next(iter(loader))
+    targets = batch["semantics"].clone()
+    targets[~batch["valid_mask"]] = 255
+    # For future model logits [B,18,200,200,16], use cross entropy with
+    # ignore_index=255. Skip batches with no valid targets.
+
+if __name__ == "__main__":
+    main()
+```
+
+Each item supplies normalized float32 RGB images [6,3,H,W], resized intrinsics
+[6,3,3], sample-ego-to-camera transforms [6,4,4], int64 semantics [200,200,16],
+boolean mask_camera and valid_mask grids, plus sample_token and scene_name.
+The batch dimension is prepended by the loader. Images use ImageNet mean
+(0.485,0.456,0.406) and standard deviation (0.229,0.224,0.225).
+Camera order is FRONT, FRONT_LEFT, FRONT_RIGHT, BACK, BACK_LEFT, BACK_RIGHT.
+All camera names have the CAM_ prefix.
+
+The official mini_train and mini_val scene splits are selected by train/val.
+Missing images or labels fail explicitly. Occupancy remains in [X,Y,Z] order,
+at 0.4 m resolution over [-40,-40,-1] to [40,40,5.4] metres.
+Class IDs 0 through 17 remain intact: class 0 is valid and class 17 is free.
+Only camera-visible, non-255 voxels enter valid_mask. Preview dot thinning and
+surface filtering never affect training labels. No raw LiDAR or LiDAR masks
+are read. Calibration accounts for each camera's acquisition pose.
+
+Use a __main__ guard for Windows worker processes; num_workers=0 is also
+supported. Training shuffles reproducibly by default; validation does not.
+This milestone prepares data only; a model and training loop are still needed.
