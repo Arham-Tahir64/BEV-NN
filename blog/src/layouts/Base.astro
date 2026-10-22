@@ -1,0 +1,47 @@
+---
+import '../styles/global.css';
+interface Props { title?: string; description?: string; article?: boolean; }
+const {
+  title = 'BEV-NN — A development log by Arham Tahir',
+  description = 'Learning, building, and documenting an efficient camera-only 3D occupancy network. An open development log by Arham Tahir.',
+  article = false,
+} = Astro.props;
+const base = import.meta.env.BASE_URL;
+const home = `${base.replace(/\/$/, '')}/`;
+const canonical = new URL(Astro.url.pathname, Astro.site);
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f7f7f0" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <meta name="author" content="Arham Tahir" />
+    <link rel="canonical" href={canonical} />
+    <link rel="icon" type="image/svg+xml" href={`${home}favicon.svg`} />
+    <link rel="alternate" type="application/rss+xml" title="BEV-NN development log" href={`${home}rss.xml`} />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:type" content={article ? 'article' : 'website'} />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:site_name" content="BEV-NN development log" />
+    <meta name="twitter:card" content="summary" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header wrap">
+      <a class="brand" href={home} aria-label="BEV-NN home"><span class="brand-mark" aria-hidden="true">◈</span> BEV-NN<span class="brand-note"> / field notes</span></a>
+      <nav aria-label="Main navigation">
+        <a href={`${home}#entries`}>The log</a>
+        <a href="https://github.com/Arham-Tahir64/BEV-NN">Source code <span aria-hidden="true">↗</span></a>
+      </nav>
+    </header>
+    <slot />
+    <footer class="site-footer wrap">
+      <div><a class="footer-name" href={home}>Arham Tahir</a><p>Learning in public. Building one experiment at a time.</p></div>
+      <div class="footer-links"><a href={`${home}rss.xml`}>RSS feed</a><a href="https://github.com/Arham-Tahir64/BEV-NN">GitHub ↗</a></div>
+    </footer>
+  </body>
+</html>

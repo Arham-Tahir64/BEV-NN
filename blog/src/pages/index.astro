@@ -1,0 +1,34 @@
+---
+import Base from '../layouts/Base.astro';
+import Scene from '../components/Scene.astro';
+import { posts, formatDate } from '../lib/posts';
+---
+<Base>
+  <main id="main" class="wrap">
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="hero-copy">
+        <p class="eyebrow">A development log / Computer vision</p>
+        <h1 id="hero-title">From pixels<br />to <em>perception.</em></h1>
+        <p class="hero-description">Building a camera-only 3D occupancy network that can fit on the hardware I actually have.</p>
+        <p class="hero-byline">Notes on learning, architecture decisions, and the experiments ahead. By <strong>Arham Tahir.</strong></p>
+        <a class="text-link" href="#entries">Follow the build <span aria-hidden="true">↓</span></a>
+      </div>
+      <Scene />
+    </section>
+    <section class="project-strip" aria-label="Project context">
+      <div><span class="small-label">The problem</span><p>Camera-only 3D occupancy</p></div>
+      <div><span class="small-label">Training hardware</span><p>RTX 4060 · 8 GB</p></div>
+      <div><span class="small-label">Deployment target</span><p>NVIDIA Jetson</p></div>
+      <div><span class="small-label">Current focus</span><p><span class="status-dot"></span> Designing the baseline</p></div>
+    </section>
+    <section id="entries" class="entries" aria-labelledby="entries-title">
+      <div class="section-heading"><h2 id="entries-title">The development log</h2><span class="small-label">{String(posts.length).padStart(2, '0')} {posts.length === 1 ? 'entry' : 'entries'} / newest first</span></div>
+      {posts.map(({ frontmatter: post, url }) => <article class="entry">
+        <div class="entry-meta"><span class="entry-number">FIELD NOTE {post.number}</span><time datetime={post.date}>{formatDate(post.date)}</time><span class="entry-status">{post.status}</span></div>
+        <div class="entry-copy"><div class="tags">{post.tags.map(tag => <span>{tag}</span>)}</div><h3><a href={url}>{post.title}</a></h3><p>{post.description}</p><a class="text-link" href={url}>Read the field note <span aria-hidden="true">↗</span></a></div>
+        <a class="entry-arrow" href={url} aria-label={`Read ${post.title}`}>↗</a>
+      </article>)}
+    </section>
+    <aside class="notebook-note"><span class="eyebrow">About this notebook</span><p>This is a record of the process: what I’m learning, why I’m making certain decisions, and what I still need to test. Results will appear here when I’ve measured them.</p><a class="text-link" href="https://github.com/Arham-Tahir64/BEV-NN">Explore the project on GitHub ↗</a></aside>
+  </main>
+</Base>
