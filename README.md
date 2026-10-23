@@ -276,8 +276,9 @@ The output directory contains:
   when validation is disabled.
 
 Use a separate output directory for each experiment; rerunning in the same
-directory replaces its logs and checkpoints. Epoch loss is weighted by the
-number of supervised voxels. A whole epoch without supervision raises an error.
+directory replaces its logs and checkpoints. Unweighted epoch loss is averaged
+over supervised voxels. Class-weighted training uses the sum of target weights
+as its averaging denominator. A whole epoch without supervision raises an error.
 The current script starts new runs; a command-line resume option is not implemented.
 
 Inspect options with:
@@ -287,3 +288,53 @@ Inspect options with:
 Run regression checks with:
 
     .\.venv\Scripts\python.exe -m unittest discover -s tests
+
+## Inspect a trained checkpoint
+
+Evaluate the first training frame recorded in your checkpoint:
+
+    .\.venv\Scripts\python.exe evaluate.py --checkpoint outputs/overfit/best.pt
+
+Results are saved under the checkpoint folder's evaluation directory:
+metrics.json, per_class.csv, predictions.npz, bev_comparison.png,
+per_class_iou.png, and camera_comparison.png. Use --output-dir to choose
+another location, or --split val --sample-index 0 to inspect a held-out frame.
+
+All metrics use camera-visible, non-ignore voxels. Occupied-class mIoU averages
+IDs 0..16 with nonzero union; class 17 (free space) is reported separately.
+Classes absent from both target and prediction have undefined IoU and are
+excluded from macro averages. Overall accuracy is compared against predicting
+free space everywhere. A training-frame diagnostic does not measure held-out
+generalization.
+
+Camera overlays show occupied surface centres only, with the same small-dot
+settings and supervision mask for ground truth and prediction. Free space
+is omitted from camera dots. Top-down images select the highest supervised
+occupied voxel in each XY column; metrics still use all supervised 3D voxels.
+
+## Class weighting and XYZ experiment
+
+The original baseline remains available. Enable inverse-square-root class
+weighting with --class-balance sqrt-inverse. Weights are estimated only from
+camera-visible, non-ignore labels in the selected training samples, never
+from validation. Observed class weights are normalized to mean one; absent
+classes keep neutral weight one. The weights and counts are saved in config.json.
+Validation and evaluate.py still report unweighted loss for comparison.
+
+Enable positional information with --xyz. OccupancyModel normalizes voxel-centre
+XYZ coordinates using the grid bounds and embeds them into the existing 32 feature
+channels with a learned 1x1x1 convolution. This embedding is added before the
+decoder. The decoder source, channel counts and convolutional stages are unchanged.
+The XYZ projection starts at zero, preserving the baseline's initial output.
+The model's use_xyz setting is saved in checkpoints; older checkpoints still load.
+
+Example new run, in a separate output directory:
+
+    .\.venv\Scripts\python.exe train.py --class-balance sqrt-inverse --xyz --output-dir outputs/new_xyz_run
+
+The first controlled checks used the same frame, seed 0, learning rate 1e-4,
+batch size 1, frozen pretrained backbone, and 100 updates per run. The saved
+comparison is outputs/overfit_comparison/results.csv. Occupied-class mIoU
+was 0% originally, 0.09% with class weighting, and 0.45% with weighting plus
+XYZ. Those are one-frame fit diagnostics, not validation results; the model
+still predicts free space for most supervised voxels.

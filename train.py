@@ -17,7 +17,7 @@ import torch
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Subset
 
-from data import DEFAULT_DATAROOT, NuScenesOccupancyDataset, make_dataloader
+from data import DEFAULT_DATAROOT, NuScenesOccupancyDataset, make_dataloader, load_occupancy_labels
 from data.nuscenes_dataset import IMAGE_MEAN, IMAGE_STD
 from src.models.occupancy_model import OccupancyModel
 
@@ -47,6 +47,10 @@ def parse_args() -> argparse.Namespace:
                         help="Use the first N training samples; 0 uses the full training split (default: 1).")
     parser.add_argument("--validate", action=argparse.BooleanOptionalAction, default=None,
                         help="Run held-out validation; defaults off for overfit mode and on for full training.")
+    parser.add_argument("--class-balance", choices=("none", "sqrt-inverse"), default="none",
+                        help="Optional inverse-square-root class weighting, estimated from selected training labels only.")
+    parser.add_argument("--xyz", action=argparse.BooleanOptionalAction, default=False,
+                        help="Add normalized XYZ positional features before the unchanged decoder.")
     args = parser.parse_args()
 
     for name in ("epochs", "batch_size"):
@@ -64,16 +68,46 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def estimate_class_weights(dataset, num_classes: int = 18) -> tuple[torch.Tensor, torch.Tensor]:
+    """Estimate inverse-sqrt weights using selected training annotations only.
+
+    Unobserved classes retain neutral weight one. Observed weights have mean
+    one; their relative ratios, rather than this common scale, affect the loss.
+    Camera images are not decoded while counting labels. Only a direct
+    NuScenesOccupancyDataset or its selected Subset is expected here.
+    """
+    source = dataset.dataset if isinstance(dataset, Subset) else dataset
+    indices = dataset.indices if isinstance(dataset, Subset) else range(len(dataset))
+    counts = torch.zeros(num_classes, dtype=torch.int64)
+    for index in indices:
+        occupancy = load_occupancy_labels(source.records[index]["label_path"])
+        labels = occupancy["semantics"]
+        valid = occupancy["mask_camera"] & (labels != 255)
+        selected = labels[valid].astype(np.int64)
+        if np.any((selected < 0) | (selected >= num_classes)):
+            raise ValueError("Training labels contain an unsupported semantic class.")
+        counts += torch.from_numpy(np.bincount(selected, minlength=num_classes))
+    observed = counts > 0
+    if not observed.any():
+        raise ValueError("Cannot estimate class weights without supervised training voxels.")
+    weights = torch.ones(num_classes, dtype=torch.float32)
+    weights[observed] = counts[observed].float().rsqrt()
+    weights[observed] /= weights[observed].mean()
+    return weights, counts
+
+
 def compute_loss(
     logits: torch.Tensor,
     semantics: torch.Tensor,
     valid_mask: torch.Tensor,
+    class_weights: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Return masked cross-entropy, or None when no supervised voxels exist.
 
     logits: [B,18,X,Y,Z], raw class scores.
     semantics: [B,X,Y,Z], int64 class IDs; ignore ID is 255.
     valid_mask: [B,X,Y,Z], boolean camera-visible, non-ignore supervision.
+    class_weights: optional positive [C] training-class weights.
     """
     if logits.ndim != 5 or any(size <= 0 for size in logits.shape):
         raise ValueError("logits must have nonempty shape [B,C,X,Y,Z].")
@@ -93,7 +127,15 @@ def compute_loss(
     if not (targets != 255).any():
         return None
 
-    return F.cross_entropy(logits, targets, ignore_index=255)
+    if class_weights is not None:
+        if class_weights.shape != (logits.shape[1],) or not class_weights.is_floating_point():
+            raise ValueError("class_weights must be a floating-point vector with one entry per class.")
+        if class_weights.device != logits.device:
+            raise ValueError("class_weights and logits must be on the same device.")
+        if not torch.isfinite(class_weights).all() or (class_weights <= 0).any():
+            raise ValueError("class_weights must be finite and positive.")
+        class_weights = class_weights.to(dtype=logits.dtype)
+    return F.cross_entropy(logits, targets, weight=class_weights, ignore_index=255)
 
 
 def train_one_epoch(
@@ -103,8 +145,9 @@ def train_one_epoch(
     scaler: torch.amp.GradScaler,
     device: torch.device,
     amp_enabled: bool,
+    class_weights: torch.Tensor | None = None,
 ) -> dict[str, float]:
-    """Update trainable weights and return voxel-weighted epoch statistics.
+    """Update weights and average epoch loss by its target-weight denominator.
 
     The scaler should be enabled only for CUDA mixed precision. Batches without
     supervised voxels are skipped; an entirely unsupervised/empty epoch raises
@@ -114,6 +157,7 @@ def train_one_epoch(
     use_amp = amp_enabled and device.type == "cuda"
     total_loss = 0.0
     total_voxels = 0
+    total_loss_weight = 0.0
     processed_batches = 0
     skipped_batches = 0
 
@@ -133,7 +177,7 @@ def train_one_epoch(
 
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
             logits = model(images, intrinsics, ego_to_camera)
-            loss = compute_loss(logits, semantics, valid_mask)
+            loss = compute_loss(logits, semantics, valid_mask, class_weights)
 
         if loss is None:
             skipped_batches += 1
@@ -148,19 +192,27 @@ def train_one_epoch(
         scaler.step(optimizer)
         scaler.update()
 
-        total_loss += loss_value * valid_voxels
+        # Match weighted cross-entropy's sum-of-target-weights denominator.
+        loss_weight = float(valid_voxels)
+        if class_weights is not None:
+            effective_weights = class_weights.to(dtype=logits.dtype)
+            target_weights = effective_weights[semantics[valid_mask & (semantics != 255)]]
+            sum_dtype = torch.float64 if logits.dtype == torch.float64 else torch.float32
+            loss_weight = target_weights.sum(dtype=sum_dtype).item()
+        total_loss += loss_value * loss_weight
+        total_loss_weight += loss_weight
         total_voxels += valid_voxels
         processed_batches += 1
         if batch_index == 1 or batch_index % 10 == 0 or batch_index == len(loader):
             print(
                 f"Train batch {batch_index}/{len(loader)}: loss={loss_value:.4f}, "
-                f"mean_loss={total_loss / total_voxels:.4f}, valid_voxels={valid_voxels}"
+                f"mean_loss={total_loss / total_loss_weight:.4f}, valid_voxels={valid_voxels}"
             )
 
     if total_voxels == 0:
         raise RuntimeError("Training epoch has no supervised voxels; check the data and visibility masks.")
     return {
-        "loss": total_loss / total_voxels,
+        "loss": total_loss / total_loss_weight,
         "valid_voxels": total_voxels,
         "batches": processed_batches,
         "skipped_batches": skipped_batches,
@@ -281,6 +333,16 @@ def main() -> None:
         shuffle=True, seed=args.seed, pin_memory=device.type == "cuda",
     )
 
+    class_weights = None
+    class_counts = None
+    if args.class_balance == "sqrt-inverse":
+        class_weights, class_counts = estimate_class_weights(
+            selected_dataset, train_dataset.num_classes
+        )
+        print(f"Training-only class counts: {class_counts.tolist()}")
+        print(f"Inverse-sqrt class weights: {[round(value, 4) for value in class_weights.tolist()]}")
+        class_weights = class_weights.to(device)
+
     val_dataset = None
     val_loader = None
     if run_validation:
@@ -300,6 +362,7 @@ def main() -> None:
         "grid_shape": train_dataset.grid_shape,
         "voxel_bounds": train_dataset.voxel_bounds,
         "voxel_chunk_size": 65536,
+        "use_xyz": args.xyz,
     }
     print(
         f"Device: {device}; AMP: {amp_enabled}; training samples: {len(selected_dataset)}; "
@@ -320,6 +383,12 @@ def main() -> None:
         "training": {key: str(value) if isinstance(value, Path) else value
                      for key, value in vars(args).items()},
         "model": model_config,
+        "loss": {
+            "class_balance": args.class_balance,
+            "class_weights": class_weights.cpu().tolist() if class_weights is not None else None,
+            "training_class_counts": class_counts.tolist() if class_counts is not None else None,
+            "validation_loss": "Unweighted masked cross-entropy for comparable evaluation.",
+        },
         "data": {
             "dataroot": str(DEFAULT_DATAROOT),
             "occupancy_root": str(train_dataset.occupancy_root),
@@ -348,7 +417,7 @@ def main() -> None:
             print(f"Epoch {epoch}/{args.epochs}")
             start = time.perf_counter()
             train_stats = train_one_epoch(
-                model, train_loader, optimizer, scaler, device, amp_enabled,
+                model, train_loader, optimizer, scaler, device, amp_enabled, class_weights,
             )
             val_stats = (
                 validate(model, val_loader, device, amp_enabled)

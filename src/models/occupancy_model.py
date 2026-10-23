@@ -25,6 +25,9 @@ class OccupancyModel(nn.Module):
     Pipeline:
         ImageEncoder -> ViewTransformer -> OccupancyDecoder.
 
+    Optional normalized XYZ coordinates are embedded into the existing feature
+    channels before decoding; the decoder architecture stays unchanged.
+
     Labels and supervision masks are used by the training loss, not passed
     into the model. Do not apply softmax before cross-entropy loss.
     """
@@ -40,6 +43,7 @@ class OccupancyModel(nn.Module):
             -40.0, -40.0, -1.0, 40.0, 40.0, 5.4
         ),
         voxel_chunk_size: int = 65536,
+        use_xyz: bool = False,
     ) -> None:
         super().__init__()
 
@@ -58,6 +62,26 @@ class OccupancyModel(nn.Module):
             hidden_channels=hidden_channels,
             num_classes=num_classes,
         )
+
+        self.use_xyz = use_xyz
+        if use_xyz:
+            # Match [X,Y,Z] voxel order and normalize metric bounds to [-1,1].
+            centres = self.view_transformer.voxel_centres
+            minimum = centres.new_tensor(voxel_bounds[:3])
+            maximum = centres.new_tensor(voxel_bounds[3:])
+            normalized = 2.0 * (centres - minimum) / (maximum - minimum) - 1.0
+            coordinates = normalized.T.reshape(1, 3, *grid_shape).contiguous()
+            self.register_buffer("voxel_coordinates", coordinates, persistent=False)
+
+            # Add position information without changing the decoder's input
+            # channel count, convolutional layers, or hidden channels.
+            # Define this AFTER the decoder to preserve its seeded initialization.
+            self.xyz_projection = nn.Conv3d(3, feature_channels, kernel_size=1, bias=False)
+            nn.init.zeros_(self.xyz_projection.weight)
+        else:
+            self.register_buffer("voxel_coordinates", None, persistent=False)
+            self.xyz_projection = None
+
 
     def forward(
         self,
@@ -83,4 +107,9 @@ class OccupancyModel(nn.Module):
         voxel_features = self.view_transformer(
             image_features, intrinsics, ego_to_camera, image_size
         )  # [B,C,X,Y,Z]
+        if self.xyz_projection is not None:
+            # The same ego-frame coordinate grid applies to every batch item.
+            # Zero initialization starts from the image-only baseline; training
+            # learns how much each coordinate contributes to each channel.
+            voxel_features = voxel_features + self.xyz_projection(self.voxel_coordinates)
         return self.occupancy_decoder(voxel_features)  # Raw logits [B,K,X,Y,Z].

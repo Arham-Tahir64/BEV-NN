@@ -88,7 +88,7 @@ class TrainingRuntimeTests(unittest.TestCase):
             args = argparse.Namespace(
                 epochs=2, lr=0.01, weight_decay=0., batch_size=1, workers=0,
                 seed=0, device="cpu", amp=True, output_dir=output,
-                overfit_samples=0, validate=None,
+                overfit_samples=0, validate=None, class_balance="none", xyz=False,
             )
             with patch("train.parse_args", return_value=args), \
                  patch("train.NuScenesOccupancyDataset", side_effect=SmallDataset), \
