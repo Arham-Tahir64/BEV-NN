@@ -65,37 +65,36 @@ class ViewTransformer(nn.Module):
         if not math.isfinite(min_depth) or min_depth <= 0:
             raise ValueError("min_depth must be finite and positive.")
 
-        self.voxel_centres = self.make_voxel_centres()
-        self.register_buffer("voxel_centres", self.voxel_centres)
+        self.register_buffer("voxel_centres", self.make_voxel_centres())
 
-def make_voxel_centres(self) -> torch.Tensor:
-    """Return metric voxel centres [V, 3], where V = X * Y * Z."""
-    minimum = self.voxel_bounds[:3]
-    maximum = self.voxel_bounds[3:]
-    grid_shape = self.grid_shape
+    def make_voxel_centres(self) -> torch.Tensor:
+        """Return metric voxel centres [V, 3], where V = X * Y * Z."""
+        minimum = self.voxel_bounds[:3]
+        maximum = self.voxel_bounds[3:]
+        grid_shape = self.grid_shape
 
-    x_size = (maximum[0] - minimum[0]) / grid_shape[0]
-    y_size = (maximum[1] - minimum[1]) / grid_shape[1]
-    z_size = (maximum[2] - minimum[2]) / grid_shape[2]
+        x_size = (maximum[0] - minimum[0]) / grid_shape[0]
+        y_size = (maximum[1] - minimum[1]) / grid_shape[1]
+        z_size = (maximum[2] - minimum[2]) / grid_shape[2]
 
-    x_centres = minimum[0] + (
-        torch.arange(grid_shape[0], dtype=torch.float32) + 0.5
-    ) * x_size
-    y_centres = minimum[1] + (
-        torch.arange(grid_shape[1], dtype=torch.float32) + 0.5
-    ) * y_size
-    z_centres = minimum[2] + (
-        torch.arange(grid_shape[2], dtype=torch.float32) + 0.5
-    ) * z_size
+        x_centres = minimum[0] + (
+            torch.arange(grid_shape[0], dtype=torch.float32) + 0.5
+        ) * x_size
+        y_centres = minimum[1] + (
+            torch.arange(grid_shape[1], dtype=torch.float32) + 0.5
+        ) * y_size
+        z_centres = minimum[2] + (
+            torch.arange(grid_shape[2], dtype=torch.float32) + 0.5
+        ) * z_size
 
-    x_grid, y_grid, z_grid = torch.meshgrid(
-        x_centres, y_centres, z_centres,
-        indexing="ij",
-    )
+        x_grid, y_grid, z_grid = torch.meshgrid(
+            x_centres, y_centres, z_centres,
+            indexing="ij",
+        )
 
-    return torch.stack(
-        [x_grid, y_grid, z_grid], dim=-1
-    ).reshape(-1, 3)
+        return torch.stack(
+            [x_grid, y_grid, z_grid], dim=-1
+        ).reshape(-1, 3)
 
     def project_voxels(
         self,
@@ -105,11 +104,48 @@ def make_voxel_centres(self) -> torch.Tensor:
         image_size: tuple[int, int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return image pixels [B,6,V,2] and valid-camera mask [B,6,V]."""
-        # TODO: Transform ego-frame centres into each camera frame.
-        # TODO: Apply intrinsics and divide by safe positive depth.
-        # TODO: Mask points behind/too close to cameras or outside the image.
-        # TODO: Keep projected pixel coordinates in the resized image frame.
-        raise NotImplementedError("Implement voxel-to-camera projection.")
+        # Transform ego-frame centres into each camera frame.
+        centres = centres.to(
+            device=ego_to_camera.device,
+            dtype=ego_to_camera.dtype,
+        )
+
+        rotation = ego_to_camera[..., :3, :3]    # [B, 6, 3, 3]
+        translation = ego_to_camera[..., :3, 3]  # [B, 6, 3]
+
+        camera_points = torch.einsum(
+            "bnij,vj->bnvi", rotation, centres
+        ) + translation.unsqueeze(-2)           # [B, 6, V, 3]
+        # Apply intrinsics and divide by safe positive depth.
+        depth = camera_points[..., 2]  # [B, 6, V]
+        valid_depth = depth > self.min_depth
+
+        # Apply each camera's intrinsic matrix.
+        projected = torch.einsum(
+            "bnij,bnvj->bnvi", intrinsics, camera_points
+        )  # [B, 6, V, 3]
+
+        # Avoid division by zero or negative depth.
+        safe_depth = depth.clamp_min(self.min_depth)
+
+        pixels = projected[..., :2] / safe_depth.unsqueeze(-1)
+        # [B, 6, V, 2], holding [u, v]
+        # Mask points behind/too close to cameras or outside the image.
+        H, W = image_size
+
+        u = pixels[..., 0]
+        v = pixels[..., 1]
+
+        inside_image = (
+            (u >= 0)
+            & (u < W)
+            & (v >= 0)
+            & (v < H)
+        )
+
+        valid = valid_depth & inside_image
+        
+        return pixels, valid
 
     def sample_features(
         self,
