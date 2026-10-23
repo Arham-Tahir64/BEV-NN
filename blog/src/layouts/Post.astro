@@ -2,7 +2,7 @@
 import Base from './Base.astro';
 import { formatDate } from '../lib/posts';
 interface Props {
-  frontmatter: { title: string; description: string; date: string; number: string; status: string; tags: string[]; };
+  frontmatter: { title: string; description: string; date: string; lastUpdated?: string; number: string; status: string; tags: string[]; };
   headings: { depth: number; slug: string; text: string; }[];
 }
 const { frontmatter: post, headings = [] } = Astro.props;
@@ -17,6 +17,7 @@ const contents = headings.filter(heading => heading.depth === 2);
       <h1>{post.title}</h1>
       <p class="post-deck">{post.description}</p>
       <div class="post-byline"><span>By <strong>Arham Tahir</strong></span><span class="entry-status">{post.status}</span></div>
+      {post.lastUpdated && <p class="post-updated">Updated <time datetime={post.lastUpdated}>{formatDate(post.lastUpdated)}</time></p>}
       <div class="tags">{post.tags.map(tag => <span>{tag}</span>)}</div>
     </header>
     <div class="post-grid">
