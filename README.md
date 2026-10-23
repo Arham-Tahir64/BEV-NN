@@ -185,7 +185,7 @@ Install CUDA-enabled PyTorch for the RTX 4060 before installing the remaining
 requirements (CPU-only environments can use the standard requirements command):
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+.\.venv\Scripts\python.exe -m pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe check_dataset.py --workers 2
 ```
@@ -228,4 +228,12 @@ are read. Calibration accounts for each camera's acquisition pose.
 
 Use a __main__ guard for Windows worker processes; num_workers=0 is also
 supported. Training shuffles reproducibly by default; validation does not.
-This milestone prepares data only; a model and training loop are still needed.
+The data pipeline is implemented. The image encoder is a TODO scaffold; the model and training loop still need implementation.
+
+## Image encoder scaffold
+
+src/models/image_encoder.py contains the ImageEncoder class skeleton, expected
+tensor shapes, and TODOs for implementing shared ResNet-18 feature extraction.
+Its constructor and forward method intentionally raise NotImplementedError.
+Implement the backbone, 512-to-64-channel projection, and camera reshaping there.
+Torchvision is installed and listed in requirements.txt.
