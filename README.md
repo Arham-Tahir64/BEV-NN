@@ -1,5 +1,12 @@
 # nuScenes mini loader
 
+## Development blog
+
+Follow the architecture decisions and experiments at
+[BEV-NN — field notes](https://arham-tahir64.github.io/BEV-NN/).
+The Astro site lives in [`blog/`](blog/README.md); new Markdown entries publish
+through GitHub Actions when pushed to `main`.
+
 Official mini dataset: https://www.nuscenes.org/data/v1.0-mini.tgz
 Official devkit: https://github.com/nutonomy/nuscenes-devkit
 
