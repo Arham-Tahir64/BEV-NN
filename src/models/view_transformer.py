@@ -4,6 +4,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+import math
+
 
 class ViewTransformer(nn.Module):
     """Project voxel centres into cameras, sample features, and fuse valid views.
@@ -42,16 +44,58 @@ class ViewTransformer(nn.Module):
         self.min_depth = min_depth
 
         # TODO: Validate grid dimensions, ordered bounds, and min_depth.
-        # TODO: Generate fixed voxel centres and register them as a buffer
-        # so they follow the module when moved to a device.
+        if len(grid_shape) != 3 or any(
+            isinstance(size, bool) or not isinstance(size, int) or size <= 0
+            for size in grid_shape
+        ):
+            raise ValueError("grid_shape must contain three positive integers.")
 
-    def make_voxel_centres(self) -> torch.Tensor:
-        """Return metric voxel centres [V, 3], where V = X * Y * Z."""
-        # TODO: Calculate voxel sizes from bounds and grid_shape.
-        # TODO: Use minimum + (index + 0.5) * voxel_size for each axis.
-        # TODO: Use meshgrid(indexing="ij") and preserve [X, Y, Z] ordering.
-        # TODO: Flatten the grid to [V, 3].
-        raise NotImplementedError("Implement voxel-centre generation.")
+        if len(voxel_bounds) != 6:
+            raise ValueError("voxel_bounds must contain (xmin, ymin, zmin, xmax, ymax, zmax).")
+
+        if not all(math.isfinite(value) for value in voxel_bounds):
+            raise ValueError("voxel_bounds must contain finite values.")
+
+        minimum = voxel_bounds[:3]
+        maximum = voxel_bounds[3:]
+
+        if any(low >= high for low, high in zip(minimum, maximum)):
+            raise ValueError("Each minimum bound must be smaller than its maximum.")
+
+        if not math.isfinite(min_depth) or min_depth <= 0:
+            raise ValueError("min_depth must be finite and positive.")
+
+        self.voxel_centres = self.make_voxel_centres()
+        self.register_buffer("voxel_centres", self.voxel_centres)
+
+def make_voxel_centres(self) -> torch.Tensor:
+    """Return metric voxel centres [V, 3], where V = X * Y * Z."""
+    minimum = self.voxel_bounds[:3]
+    maximum = self.voxel_bounds[3:]
+    grid_shape = self.grid_shape
+
+    x_size = (maximum[0] - minimum[0]) / grid_shape[0]
+    y_size = (maximum[1] - minimum[1]) / grid_shape[1]
+    z_size = (maximum[2] - minimum[2]) / grid_shape[2]
+
+    x_centres = minimum[0] + (
+        torch.arange(grid_shape[0], dtype=torch.float32) + 0.5
+    ) * x_size
+    y_centres = minimum[1] + (
+        torch.arange(grid_shape[1], dtype=torch.float32) + 0.5
+    ) * y_size
+    z_centres = minimum[2] + (
+        torch.arange(grid_shape[2], dtype=torch.float32) + 0.5
+    ) * z_size
+
+    x_grid, y_grid, z_grid = torch.meshgrid(
+        x_centres, y_centres, z_centres,
+        indexing="ij",
+    )
+
+    return torch.stack(
+        [x_grid, y_grid, z_grid], dim=-1
+    ).reshape(-1, 3)
 
     def project_voxels(
         self,
