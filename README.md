@@ -210,7 +210,7 @@ def main():
     batch = next(iter(loader))
     targets = batch["semantics"].clone()
     targets[~batch["valid_mask"]] = 255
-    # For future model logits [B,18,200,200,16], use cross entropy with
+    # For model logits [B,18,200,200,16], use cross entropy with
     # ignore_index=255. Skip batches with no valid targets.
 
 if __name__ == "__main__":
@@ -235,12 +235,55 @@ are read. Calibration accounts for each camera's acquisition pose.
 
 Use a __main__ guard for Windows worker processes; num_workers=0 is also
 supported. Training shuffles reproducibly by default; validation does not.
-The data pipeline is implemented. The image encoder is a TODO scaffold; the model and training loop still need implementation.
+The data pipeline, occupancy model, and training entry point are implemented.
 
-## Image encoder scaffold
+## Image encoder
 
-src/models/image_encoder.py contains the ImageEncoder class skeleton, expected
-tensor shapes, and TODOs for implementing shared ResNet-18 feature extraction.
-Its constructor and forward method intentionally raise NotImplementedError.
-Implement the backbone, 512-to-64-channel projection, and camera reshaping there.
-Torchvision is installed and listed in requirements.txt.
+src/models/image_encoder.py uses a shared ImageNet-pretrained ResNet-18 through
+layer3 (stride 16), with a trainable 256-to-32-channel projection. The backbone
+is frozen, including BatchNorm statistics. At 320x576 image resolution, features
+are [B,6,32,20,36]. ViewTransformer projects voxel centres into the cameras,
+samples those features, and averages valid views; OccupancyDecoder predicts
+18 class logits per voxel. OccupancyModel connects all three components.
+
+## Training
+
+Start with the one-frame overfit check (batch size 1, zero workers, 100 epochs):
+
+    .\.venv\Scripts\python.exe train.py --output-dir outputs/overfit
+
+The first run downloads official ImageNet ResNet-18 weights if not cached.
+CUDA is selected automatically when available, with mixed precision enabled.
+Use --device cpu or --no-amp to override this. Only trainable parameters enter
+AdamW. Visible class 0 and class-17 free space remain supervised; unobserved
+and ignore-255 voxels are excluded. All-ignore batches are skipped.
+
+For the full mini split (323 training and 81 held-out validation frames):
+
+    .\.venv\Scripts\python.exe train.py --overfit-samples 0 --epochs 10 --output-dir outputs/full_mini
+
+Validation defaults off for overfit runs and on for full-split runs. Override
+with --validate or --no-validate. Validation uses eval mode and no gradients.
+It reports masked cross-entropy and voxel accuracy, including free space;
+this accuracy is not class-balanced IoU.
+
+The output directory contains:
+
+- config.json: training/model settings, image normalization, grid and camera metadata.
+- metrics.jsonl: one JSON record per epoch with training/validation statistics.
+- latest.pt: model, optimizer and gradient-scaler state from the latest epoch.
+- best.pt: lowest validation-loss checkpoint, or lowest training-loss checkpoint
+  when validation is disabled.
+
+Use a separate output directory for each experiment; rerunning in the same
+directory replaces its logs and checkpoints. Epoch loss is weighted by the
+number of supervised voxels. A whole epoch without supervision raises an error.
+The current script starts new runs; a command-line resume option is not implemented.
+
+Inspect options with:
+
+    .\.venv\Scripts\python.exe train.py --help
+
+Run regression checks with:
+
+    .\.venv\Scripts\python.exe -m unittest discover -s tests
