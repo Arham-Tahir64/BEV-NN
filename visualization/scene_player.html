@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BEV-NN · scene player</title>
+<script src="/plotly.min.js"></script>
+<style>
+:root{color-scheme:dark;font:14px system-ui;background:#101620;color:#e2e8f0}body{max-width:1550px;margin:auto;padding:16px}h1{font-size:22px;margin:0 0 8px}.muted{color:#a4b1c2;font-size:12px}header,.toolbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.toolbar{background:#1c2634;padding:12px;border-radius:10px;margin:12px 0;position:sticky;top:0;z-index:10}button,select{background:#293a50;border:1px solid #50617a;color:#fff;padding:7px 12px;border-radius:5px}button:hover{background:#3a5270}button:disabled{opacity:.45}input[type=range]{flex:1;min-width:180px}.cameras{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.card{background:#17212f;border:1px solid #2d3c50;border-radius:8px;overflow:hidden}.card h2{font-size:12px;font-weight:600;margin:0;padding:7px 10px;color:#b5c8de}.cameras img{display:block;width:100%;aspect-ratio:16/9;object-fit:contain}.volumes{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}.volume-head{display:flex;align-items:center;gap:12px;padding:8px 12px}.volume-head h2{font-size:15px;margin:0}.bev{width:250px;max-width:95%;image-rendering:pixelated;display:block;margin:auto}.bev-wrap{text-align:center}.axes{font-size:11px;color:#9cafc5}.plot{height:350px}.status{background:#1c2634;padding:10px;border-radius:6px;margin:10px 0;font-variant-numeric:tabular-nums}.legend{display:flex;gap:12px;flex-wrap:wrap;font-size:12px;padding:12px 0}.swatch{display:inline-block;width:10px;height:10px;margin-right:5px}.error{color:#fda4af}label{white-space:nowrap}@media(max-width:800px){.volumes{grid-template-columns:1fr}.cameras{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<header><h1>BEV-NN · scene player</h1><span id="scene" class="muted">Connecting…</span></header>
+<p class="muted" id="scope">Six-camera keyframes and ego-centred 3D occupancy.</p>
+<div class="toolbar">
+<button id="play" disabled>Play</button><button id="prev" disabled>←</button><button id="next" disabled>→</button>
+<input id="frame" aria-label="Frame" type="range" min="0" max="0" value="0" step="1">
+<span id="position">0 / 0</span>
+<label>Speed <select id="speed"><option>0.25</option><option>0.5</option><option selected>1</option><option>2</option></select>×</label>
+<label><input id="live" type="checkbox" checked> Live inference</label>
+<label><input id="loop" type="checkbox" checked> Loop</label>
+<label><input id="sync" type="checkbox" checked> Sync 3D views</label>
+<label>3D <select id="geometry"><option value="centres" selected>Voxel centres · faster</option><option value="cubes">Voxel cubes · exact surfaces</option></select></label>
+<label>Height <select id="height"><option value="1">×1 true scale</option><option value="3" selected>×3</option><option value="6">×6</option></select></label>
+</div>
+<div class="cameras" id="cameras"></div>
+<div class="status" id="status" role="status">Loading checkpoint information…</div>
+<div class="volumes">
+<section class="card"><div class="volume-head"><h2>Ground truth</h2><span class="muted">Visible, non-ignore voxels</span></div><div class="bev-wrap"><img class="bev" id="bev-gt" alt="Ground truth BEV"><span class="axes">BEV: forward ↑ · left → · ±40 m</span></div><div id="plot-gt" class="plot"></div></section>
+<section class="card"><div class="volume-head"><h2>Model prediction</h2><span class="muted">Same visible region</span></div><div class="bev-wrap"><img class="bev" id="bev-pred" alt="Predicted BEV"><span class="axes">BEV: forward ↑ · left → · ±40 m</span></div><div id="plot-pred" class="plot"></div></section>
+</div>
+<div class="legend" id="legend"></div>
+<p class="muted">3D retains all 16 height layers of 0.4 m voxels. Choose voxel centres for faster playback or cubes for exact exposed faces. Free/unknown voxels are omitted; no occupied voxels are subsampled. Height exaggeration changes only the display. Camera rotation and zoom persist across frames. Keyboard: Space play/pause, ←/→ step. Playback never drops frames; it slows if inference or rendering cannot keep up.</p>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const state = {info:null,index:-1,playing:false,busy:false,timer:null,gesture:false,wheelUntil:0,shown:0,geometry:'centres',prefetch:null};
+let syncTimer=null,syncing=false,lastPlot='gt';
+const plots={};
+const clone = x => JSON.parse(JSON.stringify(x));
+function rendererCamera(plot){const r=plot._fullLayout?.scene?._scene;return clone(r?.getCamera?r.getCamera():plot.layout.scene.camera);}
+async function request(url){const r=await fetch(url);if(!r.ok)throw new Error(`Request failed (${r.status})`);return r.json();}
+function frameURL(index){return `/api/frame?index=${index}&fresh=${$('live').checked?1:0}&geometry=${$('geometry').value}`;}
+function decode64(text){const s=atob(text),a=new Uint8Array(s.length);for(let n=0;n<s.length;n++)a[n]=s.charCodeAt(n);return a;}
+function meshData(mesh){
+    const corners=decode64(mesh.corners),labels=decode64(mesh.classes),count=mesh.faces;
+    const x=new Float32Array(count*4),y=new Float32Array(count*4),z=new Float32Array(count*4);
+    const i=new Uint32Array(count*2),j=new Uint32Array(count*2),k=new Uint32Array(count*2),intensity=new Uint8Array(count*2);
+    for(let n=0;n<count;n++){
+        for(let q=0;q<4;q++){const a=n*4+q,b=a*3;x[a]=-40+corners[b]*.4;y[a]=-40+corners[b+1]*.4;z[a]=-1+corners[b+2]*.4;}
+        const a=n*4,b=n*2;i[b]=a;j[b]=a+1;k[b]=a+2;i[b+1]=a;j[b+1]=a+2;k[b+1]=a+3;intensity[b]=labels[n];intensity[b+1]=labels[n];
+    }
+    return {x,y,z,i,j,k,intensity};
+}
+function centresData(centres){
+    const indices=decode64(centres.indices),labels=decode64(centres.classes),n=centres.count;
+    const x=new Float32Array(n),y=new Float32Array(n),z=new Float32Array(n);
+    for(let i=0;i<n;i++){x[i]=-40+(indices[i*3]+.5)*.4;y[i]=-40+(indices[i*3+1]+.5)*.4;z[i]=-1+(indices[i*3+2]+.5)*.4;}
+    return {x,y,z,labels};
+}
+function scale(){const out=[],p=state.info.palette;for(let i=0;i<p.length;i++){const c=`rgb(${p[i].join(',')})`;out.push([i/p.length,c],[(i+1)/p.length,c]);}return out;}
+function quiet(){return !state.gesture && performance.now()>=state.wheelUntil;}
+function sync(source){
+    lastPlot=source;clearTimeout(syncTimer);
+    if(!$('sync').checked||syncing)return;
+    syncTimer=setTimeout(async()=>{
+        if(!quiet()){sync(source);return;}
+        const target=source==='gt'?'pred':'gt';syncing=true;
+        try{await Plotly.relayout(plots[target],{'scene.camera':rendererCamera(plots[source])});}
+        finally{syncing=false;}
+    },250);
+}
+function emptyTrace(geometry){
+    if(geometry==='centres')return {type:'scatter3d',mode:'markers',x:[],y:[],z:[],hoverinfo:'skip',
+        marker:{size:2,color:[],cmin:-.5,cmax:18.5,colorscale:scale(),showscale:false,opacity:1},showlegend:false};
+    return {type:'mesh3d',x:[],y:[],z:[],i:[],j:[],k:[],intensity:[],intensitymode:'cell',
+        cmin:-.5,cmax:18.5,colorscale:scale(),showscale:false,flatshading:true,lighting:{ambient:.75,diffuse:.5},hoverinfo:'skip'};
+}
+async function initPlot(key){
+    const plot=$("plot-"+key);
+    await Plotly.newPlot(plot,[emptyTrace(state.geometry)],{paper_bgcolor:'#17212f',plot_bgcolor:'#17212f',font:{color:'#cbd5e1'},margin:{l:0,r:0,t:0,b:0},
+        uirevision:'keep-camera',scene:{uirevision:'keep-camera',dragmode:'orbit',aspectmode:'manual',aspectratio:{x:1,y:1,z:.24},
+        camera:{eye:{x:1.3,y:-1.7,z:1.2}},xaxis:{title:{text:'X forward (m)'},range:[-40,40]},
+        yaxis:{title:{text:'Y left (m)'},range:[-40,40]},zaxis:{title:{text:'Z up (m)'},range:[-1,5.4]}}},
+        {responsive:true,scrollZoom:true,displaylogo:false,modeBarButtonsToRemove:['toImage']});
+    plots[key]=plot;
+    plot.on('plotly_relayout',event=>{if(Object.keys(event).some(k=>k.startsWith('scene.camera')))sync(key);});
+    plot.on('plotly_relayouting',()=>{if(!syncing)clearTimeout(syncTimer);});
+    plot.addEventListener('pointerdown',()=>{state.gesture=true;clearTimeout(syncTimer);});
+    plot.addEventListener('wheel',()=>{state.wheelUntil=performance.now()+300;sync(key);},{capture:true,passive:true});
+}
+window.addEventListener('pointerup',()=>{state.gesture=false;});
+window.addEventListener('pointercancel',()=>{state.gesture=false;});
+async function waitForGesture(){while(!quiet())await new Promise(resolve=>setTimeout(resolve,30));}
+async function show(index){
+    if(state.busy)return false;
+    state.busy=true;const start=performance.now();
+    try{
+        const geometry=$('geometry').value,url=frameURL(index);
+        const prefetched=state.prefetch?.url===url?state.prefetch.promise:null;
+        state.prefetch=null;
+        const frame=(prefetched?await prefetched:null)||await request(url);
+        // Run inference for the next frame while this frame renders. Only one
+        // frame is prefetched; model requests remain serialized by the server.
+        let ahead=index+1;
+        if(ahead>=state.info.frames&&$('loop').checked)ahead=0;
+        if(state.playing&&ahead<state.info.frames){
+            const nextURL=frameURL(ahead);
+            state.prefetch={url:nextURL,promise:request(nextURL).catch(()=>null)};
+        }
+        await waitForGesture();
+        // Keep each renderer's actual current camera before changing geometry.
+        if(state.index>=0)for(const key of ['gt','pred'])plots[key].layout.scene.camera=rendererCamera(plots[key]);
+        if(geometry!==state.geometry){
+            await Promise.all(['gt','pred'].map(key=>Plotly.react(plots[key],[emptyTrace(geometry)],plots[key].layout)));
+            state.geometry=geometry;
+        }
+        await Promise.all(['gt','pred'].map(key=>{
+            const data=geometry==='cubes'?meshData(frame.volumes[key].mesh):centresData(frame.volumes[key].centres), update={};
+            if(data.labels){update['marker.color']=[data.labels];delete data.labels;}
+            for(const [name,value] of Object.entries(data))update[name]=[value];
+            return Plotly.restyle(plots[key],update,[0]);
+        }));
+        for(const key of state.info.camera_order)$('img-'+key).src=frame.cameras[key];
+        for(const key of ['gt','pred'])$('bev-'+key).src=frame.volumes[key].bev;
+        state.index=index;$('frame').value=index;
+        $('position').textContent=`${index+1} / ${state.info.frames} · ${frame.time.toFixed(2)} s`;
+        const display=performance.now()-start;
+        $('status').textContent=`${frame.cache_hit?'Cached playback':'Live inference'} · model ${frame.model_ms.toFixed(0)} ms · backend ${frame.backend_ms.toFixed(0)} ms · fetch + render ${display.toFixed(0)} ms · occupied ${frame.predicted_occupied.toLocaleString()} predicted / ${frame.gt_occupied.toLocaleString()} GT`;
+        $('status').classList.remove('error');
+        return true;
+    }catch(error){pause();$('status').textContent=error.message;$('status').classList.add('error');return false;}
+    finally{state.busy=false;}
+}
+function pause(){state.playing=false;clearTimeout(state.timer);$('play').textContent='Play';}
+async function tick(){
+    if(!state.playing)return;
+    if(state.busy||!quiet()){state.timer=setTimeout(tick,40);return;}
+    let next=state.index+1;
+    if(next>=state.info.frames){if(!$('loop').checked){pause();return;}next=0;}
+    const started=performance.now();
+    if(!await show(next)||!state.playing)return;
+    const times=state.info.times,interval=next+1<times.length?times[next+1]-times[next]:times[1]-times[0];
+    const remaining=interval*1000/Number($('speed').value)-(performance.now()-started);
+    state.timer=setTimeout(tick,Math.max(0,remaining));
+}
+function toggle(){if(state.playing)pause();else{state.playing=true;$('play').textContent='Pause';tick();}}
+async function step(delta){pause();await show(Math.max(0,Math.min(state.info.frames-1,state.index+delta)));}
+async function initialize(){
+    state.info=await request('/api/info');const info=state.info;
+    $('scene').textContent=`${info.scene} · ${info.split} scene · epoch ${info.epoch} · ${info.device}`;
+    $('scope').textContent=info.scope+' Live inference recomputes the model on every requested frame; turn it off to reuse cached results.';
+    for(const name of info.camera_order){const card=document.createElement('section');card.className='card';const title=document.createElement('h2');title.textContent=name;const img=document.createElement('img');img.id='img-'+name;img.alt=name;card.append(title,img);$('cameras').append(card);}
+    for(const id of [11,4,15,16,13,7,1,14]){const item=document.createElement('span'),swatch=document.createElement('i');swatch.className='swatch';swatch.style.background=`rgb(${info.palette[id].join(',')})`;item.append(swatch,document.createTextNode(info.classes[id]));$('legend').append(item);}
+    await Promise.all([initPlot('gt'),initPlot('pred')]);
+    $('frame').max=info.frames-1;
+    $('play').onclick=toggle;$('prev').onclick=()=>step(-1);$('next').onclick=()=>step(1);
+    $('frame').oninput=()=>{pause();};$('frame').onchange=()=>{show(Number($('frame').value));};
+    $('sync').onchange=()=>{if($('sync').checked)sync(lastPlot);else clearTimeout(syncTimer);};
+    $('height').onchange=async()=>{await waitForGesture();const z=.08*Number($('height').value);await Promise.all(Object.values(plots).map(p=>Plotly.relayout(p,{'scene.aspectratio.z':z})));};
+    $('geometry').onchange=async()=>{pause();while(state.busy)await new Promise(r=>setTimeout(r,40));await show(Math.max(0,state.index));};
+    document.addEventListener('keydown',event=>{if(['INPUT','SELECT'].includes(event.target.tagName))return;if(event.code==='Space'){event.preventDefault();toggle();}else if(event.key==='ArrowLeft')step(-1);else if(event.key==='ArrowRight')step(1);});
+    for(const id of ['play','prev','next'])$(id).disabled=false;
+    await show(0);
+}
+initialize().catch(error=>{$('status').textContent=error.message;$('status').classList.add('error');});
+</script>
+</body>
+</html>
