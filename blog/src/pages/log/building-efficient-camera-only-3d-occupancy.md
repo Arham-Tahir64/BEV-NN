@@ -1,11 +1,11 @@
 ---
 layout: ../../layouts/Post.astro
 title: "Building an efficient camera-only 3D occupancy model"
-description: "From the initial architecture plan to a working camera-to-voxel model—and a first output that predicts every supervised voxel as free."
+description: "Building a camera-to-voxel model, inspecting its first predictions, and investigating depth ambiguity with FPN features and BEVDepth-inspired lifting."
 date: "2026-10-21"
 lastUpdated: "2026-10-23"
 number: "01"
-status: "First training diagnostics"
+status: "Investigating depth ambiguity"
 tags: ["3D perception", "PyTorch", "Edge deployment"]
 ---
 
@@ -13,7 +13,7 @@ I’m building a camera-only 3D semantic occupancy network, and I’m documentin
 
 That means predicting a 3D grid containing roads, vehicles, pedestrians, and other scene elements. It also means learning enough computer vision to understand why a particular architecture works, rather than just getting someone else’s model to run.
 
-> **Updated October 23, 2026:** the baseline model and training entry point are now implemented. Sections 01–07 preserve my original design notes from October 21; [the implementation update](#08-what-the-model-actually-does-now) describes the code as it stands, and [the first output](#09-first-output-every-supervised-voxel-is-free) shows what still needs work. I’m not reporting held-out IoU, mIoU, or deployment benchmarks yet.
+> **Updated October 23, 2026:** the model and training entry point are implemented. Sections 01–07 preserve my original design notes from October 21; sections 08–10 record the first implementation and all-free diagnostic. The [latest visualization](#11-latest-visualization-where-does-a-surface-start-and-end) now shows occupied predictions with stretched geometry, shifting my investigation toward depth ambiguity and occlusion. These images are qualitative snapshots, not a controlled benchmark or proof of a single failure cause.
 
 ## 01. Learning the fundamentals
 
@@ -247,6 +247,65 @@ This update describes [code revision 7f8f7d1](https://github.com/Arham-Tahir64/B
 - [View transformer](https://github.com/Arham-Tahir64/BEV-NN/blob/7f8f7d1/src/models/view_transformer.py): voxel centres, projection, sampling, and masked mean fusion.
 - [Occupancy decoder](https://github.com/Arham-Tahir64/BEV-NN/blob/7f8f7d1/src/models/occupancy_decoder.py) and [model wrapper](https://github.com/Arham-Tahir64/BEV-NN/blob/7f8f7d1/src/models/occupancy_model.py): dense 3D decoding and the connected forward pass.
 - [Training entry point](https://github.com/Arham-Tahir64/BEV-NN/blob/7f8f7d1/train.py) and [dataset](https://github.com/Arham-Tahir64/BEV-NN/blob/7f8f7d1/data/nuscenes_dataset.py): active settings, supervision, optimization, and validation accuracy.
+
+## 11. Latest visualization: where does a surface start and end?
+
+**October 23, 2026 — depth ambiguity update.** The latest supplied comparison contains occupied semantic predictions, unlike the earlier all-free example. But their spatial extent is still wrong in important places: the prediction has long, ray-like streaks where the ground truth has more localized structures.
+
+<figure>
+  <a href="/BEV-NN/images/depth-ambiguity-occupancy.png" aria-label="Open the latest ground-truth and prediction comparison at full resolution">
+    <img src="/BEV-NN/images/depth-ambiguity-occupancy.png" width="1545" height="706" loading="lazy" alt="Ground truth on the left and model prediction on the right, each with a top-down view above a 3D voxel view. Predicted semantic regions form elongated radial streaks compared with the more localized ground-truth structures." />
+  </a>
+  <figcaption>Latest supplied visualization: ground truth on the left, prediction on the right. Both are displayed in the same camera-visible, non-ignore comparison region. The top panels summarize occupancy in BEV; the lower panels show its 3D structure. <a href="/BEV-NN/images/depth-ambiguity-occupancy.png">Open the full-resolution image</a>.</figcaption>
+</figure>
+
+Seeing occupied labels is different from placing them correctly in 3D. In this example, semantic evidence appears spread along directions through the scene rather than consistently stopping at object boundaries. The display is filtered to a shared supervised region; it does not show complete predictions in unobserved space. The image does not supply a checkpoint, epoch, or sample identity, so I’m treating it as another qualitative observation rather than a measured improvement over the previous run.
+
+### Many 3D voxels can share one image location
+
+The current lifting operation asks: **“Where would this voxel appear in each camera?”** It does not explicitly answer: **“At what distance did the camera actually observe a surface?”**
+
+Perspective projection divides camera-frame coordinates by depth. Points at different distances along the same camera ray therefore project to the same image location:
+
+```text
+Camera ── voxel A ── visible surface B ── hidden voxel C
+           \________ same image location __________/
+
+Different candidate depths → the same 2D appearance evidence
+```
+
+In the baseline, these voxels can sample the same image feature even though one is in front of the surface, one lies on it, and another is behind it. The stride-16 feature map also means nearby image projections can sample similar coarse features. Being in front of the camera and inside the image makes a sample geometrically valid; it does not establish that the voxel is occupied or visible.
+
+The decoder must learn where that appearance belongs in depth from the available features, other views, and supervision. Without an explicit depth estimate or visibility mechanism, it can struggle to determine **where an object starts and ends along a ray**. The radial stretching in this visualization is consistent with that ambiguity. It does not by itself rule out calibration, sampling, optimization, or other representation problems.
+
+### Occlusion makes the missing information harder to recover
+
+For an opaque object, a camera directly observes its front-facing surface, not everything behind it. Sampling that surface’s image feature for a voxel farther down the ray does not reveal whether the voxel belongs to the same object, another object, or empty space.
+
+Multiple views can help when they provide different views of the same region. But overlap is limited, and the current masked mean fusion does not learn which camera is occluded. This is why the geometry check and the ground-truth camera supervision mask are not substitutes for depth-aware lifting.
+
+Even accurate visible-surface depth would not fully specify the object’s rear boundary or hidden structure. Those still require additional views, learned scene priors, or occupancy reasoning. Depth would provide a stronger constraint on feature placement, not a complete solution to 3D scene completion.
+
+The [latest code snapshot, 69201d3](https://github.com/Arham-Tahir64/BEV-NN/commit/69201d3), also supports optional XYZ feature embeddings and class-balanced training. Coordinates can distinguish voxel positions, and class weighting can change the optimization balance, but neither directly measures surface depth. The screenshot alone does not establish which options were enabled for this run. The view transformer still uses geometric sampling and masked averaging without a depth head.
+
+## 12. Investigating FPN and BEVDepth for depth-aware lifting
+
+My next research direction is making feature placement more aware of distance. I’m looking into **FPN features** and **BEVDepth**, which address different parts of that problem and could be used together.
+
+| Direction | What it contributes | What it does not provide by itself |
+| --- | --- | --- |
+| Feature Pyramid Network | Multi-scale image features combining finer spatial detail with stronger semantic context | A metric depth estimate or an occlusion decision |
+| BEVDepth-inspired depth estimation | Explicitly learned depth information to guide image-to-3D feature placement | A ready-made 3D semantic occupancy model or complete hidden geometry |
+
+An **FPN** builds multi-scale features with a top-down pathway and lateral connections. I’m interested in those features as inputs to a depth-prediction module, especially near boundaries and small objects. Adding an FPN alone would still leave the depth-placement question unanswered; a depth head and a learning objective would be separate choices. [Feature Pyramid Networks paper](https://arxiv.org/abs/1612.03144)
+
+**BEVDepth** is a more direct depth-estimation reference. It uses explicit depth supervision derived from LiDAR and camera-aware depth prediction for camera-based 3D detection. LiDAR supplies training targets; inference remains camera-based. Its original task is BEV object detection, so adapting its depth component to this occupancy pipeline would require preserving the 3D voxel representation rather than simply replacing it with a detection-oriented BEV output. [BEVDepth paper](https://arxiv.org/html/2206.10092v2)
+
+The experiment I want to investigate is predicting a distribution over candidate depths for an image location, then using that distribution to weight where its features contribute in 3D. Instead of repeatedly assigning the same appearance without an explicit depth preference, the lifting stage would have a learned estimate of where the visible surface is likely to lie. That is a proposed change, not something the current model implements.
+
+I want to compare the existing geometric baseline, an FPN-only feature variant, and a depth-aware variant while keeping the data split and evaluation masks fixed. The checks should include occupied IoU, per-class semantic IoU, boundary quality, and the extent of ray-like errors, alongside depth quality where targets are available, memory use, and latency. That would help distinguish the benefit of richer image features from the benefit of explicit depth information.
+
+For now, the question driving the next iteration is: **can depth-aware lifting reduce the ambiguity about where image evidence belongs in 3D, without losing the efficiency that motivated this baseline?**
 
 ### References & project links
 
