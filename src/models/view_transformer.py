@@ -212,12 +212,31 @@ class ViewTransformer(nn.Module):
         counts = camera_mask.sum(dim=1).clamp_min(1)  # [B, 1, V]
         return feature_sum / counts.to(dtype=sampled.dtype)
 
+    def sample_depth_support(self, probabilities, pixels, depths, edges):
+        """Trilinear sampling returns [B,N,V], never [B,N,D,V].
+
+        Uniform bins; border padding extends end-bin centres to their edges.
+        Explicit masks exclude out-of-range depth and image positions. FP32
+        sampling supports CPU and CUDA AMP with gradients to the depth head.
+        """
+        b, n, d, h, w = probabilities.shape
+        xy = 2 * (pixels.float() / 16 + 0.5) / pixels.new_tensor([w, h]).float() - 1
+        z = 2 * (depths.float() - edges[0]) / (edges[-1] - edges[0]) - 1
+        grid = torch.cat((xy, z.unsqueeze(-1)), dim=-1).reshape(b*n, 1, -1, 1, 3)
+        with torch.autocast(device_type=probabilities.device.type, enabled=False):
+            support = F.grid_sample(probabilities.float().reshape(b*n, 1, d, h, w),
+                                    grid, align_corners=False, padding_mode="border")
+        support = support.reshape(b, n, -1)
+        return support.masked_fill((depths < edges[0]) | (depths >= edges[-1]), 0)
+
     def forward(
         self,
         features: torch.Tensor,
         intrinsics: torch.Tensor,
         ego_to_camera: torch.Tensor,
         image_size: tuple[int, int],
+        *, depth_probs: torch.Tensor | None = None,
+        depth_edges: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Lift per-camera features into [B,C,X,Y,Z] voxel features.
 
@@ -247,6 +266,19 @@ class ViewTransformer(nn.Module):
         if not (features.device == intrinsics.device == ego_to_camera.device):
             raise ValueError("Features and camera calibration must be on the same device.")
 
+        if depth_probs is not None:
+            if (depth_probs.ndim != 5 or depth_probs.shape[:2] != (batch_size, cameras)
+                    or depth_probs.shape[-2:] != (feature_height, feature_width)):
+                raise ValueError("depth_probs must be [B,6,D,h,w] matching image features.")
+            if depth_edges is None or depth_edges.shape != (depth_probs.shape[2] + 1,):
+                raise ValueError("Provide D+1 uniform depth_edges.")
+            if depth_probs.device != features.device or depth_edges.device != features.device:
+                raise ValueError("Depth inputs must be on the features device.")
+            widths = depth_edges[1:] - depth_edges[:-1]
+            if (not torch.isfinite(depth_edges).all() or not (widths > 0).all()
+                    or not torch.allclose(widths, widths[:1].expand_as(widths), atol=1e-5)):
+                raise ValueError("Depth edges must be finite, increasing and uniformly spaced.")
+
         geometry_dtype = (
             torch.float64
             if torch.float64 in (intrinsics.dtype, ego_to_camera.dtype)
@@ -263,6 +295,14 @@ class ViewTransformer(nn.Module):
                     centres, intrinsics, ego_to_camera, image_size
                 )
             sampled = self.sample_features(features, pixels, image_size)
+            if depth_probs is not None:
+                with torch.autocast(device_type=features.device.type, enabled=False):
+                    depths = torch.einsum("bnj,vj->bnv", ego_to_camera[..., 2, :3],
+                                          centres.to(geometry_dtype)) + ego_to_camera[..., 2, 3, None]
+                support = self.sample_depth_support(depth_probs, pixels, depths, depth_edges)
+                sampled = sampled * support.unsqueeze(2).to(sampled.dtype)
+                # Retain the geometric-view-count denominator. Normalizing by
+                # support would cancel the gate for a single contributing view.
             fused_chunks.append(self.fuse_features(sampled, valid))
 
         # Concatenation preserves gradients and the original [X,Y,Z] order.

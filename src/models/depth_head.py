@@ -1,28 +1,7 @@
-"""Shared image-space depth head for a future depth-conditioned voxel lift.
-
-This module is not yet connected to OccupancyModel. Feed it ResNet layer3
-features BEFORE the encoder's 256-to-32 context projection:
-
-    backbone_features: [B, 6, 256, h, w]
-    depth_logits = head(backbone_features)       # [B, 6, D, h, w]
-    depth_probabilities = depth_logits.float().softmax(dim=2)
-
-Depth is camera-space Z in metres, not distance from the ego origin. The
-default uniform bin edges cover [0.1, 64.1] metres; these are provisional
-experiment settings to validate against training depths.
-
-Integration still required:
-  * Expose backbone features from ImageEncoder and instantiate this branch.
-  * Generate/cache trustworthy first-surface targets; mask unknown rays and
-    out-of-range depths rather than clamping them into the end bins.
-  * Train logits with a masked depth loss alongside the occupancy objective.
-  * Sample probabilities at (u, v, camera_Z) in ViewTransformer, using the
-    actual bin centres and chunked sampling rather than expanding D per voxel.
-  * Preserve depth-support magnitude in fusion; dividing by summed support
-    would cancel the gate in regions seen by only one camera.
-
-This is a lightweight BEVDepth-inspired building block, not the full BEVDepth
-architecture. No depth targets or ground-truth masks are inference inputs.
+"""Shared depth-bin classifier used by OccupancyModel(use_depth=True).
+Input [B,N,256,h,w]; output raw logits [B,N,D,h,w]. Camera-Z bins are
+uniform. See DEPTH_INTEGRATION.md for supervision and lifting behavior.
+This is a lightweight BEVDepth-inspired component, not the full detector.
 """
 from __future__ import annotations
 

@@ -7,6 +7,7 @@ from torch import nn
 from .image_encoder import ImageEncoder
 from .view_transformer import ViewTransformer
 from .occupancy_decoder import OccupancyDecoder
+from .depth_head import DepthHead
 
 
 class OccupancyModel(nn.Module):
@@ -44,6 +45,10 @@ class OccupancyModel(nn.Module):
         ),
         voxel_chunk_size: int = 65536,
         use_xyz: bool = False,
+        use_depth: bool = False,
+        depth_bins: int = 64,
+        depth_min: float = 0.1,
+        depth_max: float = 64.1,
     ) -> None:
         super().__init__()
 
@@ -82,13 +87,18 @@ class OccupancyModel(nn.Module):
             self.register_buffer("voxel_coordinates", None, persistent=False)
             self.xyz_projection = None
 
+        # Opt-in: old configurations retain identical parameters and outputs.
+        self.depth_head = DepthHead(num_bins=depth_bins, min_depth=depth_min,
+                                    max_depth=depth_max) if use_depth else None
+
 
     def forward(
         self,
         images: torch.Tensor,
         intrinsics: torch.Tensor,
         ego_to_camera: torch.Tensor,
-    ) -> torch.Tensor:
+        *, return_aux: bool = False,
+    ):
         """Return per-voxel class logits while preserving [X,Y,Z] order."""
         if images.ndim != 5:
             raise ValueError("images must have shape [B,6,3,H,W].")
@@ -103,13 +113,25 @@ class OccupancyModel(nn.Module):
             raise ValueError("Images and camera calibration must be on the same device.")
 
         image_size = tuple(images.shape[-2:])  # (H, W) of the resized input images.
-        image_features = self.image_encoder(images)  # [B,6,C,h,w]
+        depth_logits = None
+        if self.depth_head is not None:
+            image_features, backbone = self.image_encoder(images, return_backbone=True)
+            depth_logits = self.depth_head(backbone)
+        else:
+            image_features = self.image_encoder(images)
+        depth_args = {} if depth_logits is None else {
+            "depth_probs": depth_logits.float().softmax(dim=2),
+            "depth_edges": self.depth_head.bin_edges,
+        }
         voxel_features = self.view_transformer(
-            image_features, intrinsics, ego_to_camera, image_size
+            image_features, intrinsics, ego_to_camera, image_size, **depth_args
         )  # [B,C,X,Y,Z]
         if self.xyz_projection is not None:
             # The same ego-frame coordinate grid applies to every batch item.
             # Zero initialization starts from the image-only baseline; training
             # learns how much each coordinate contributes to each channel.
             voxel_features = voxel_features + self.xyz_projection(self.voxel_coordinates)
-        return self.occupancy_decoder(voxel_features)  # Raw logits [B,K,X,Y,Z].
+        logits = self.occupancy_decoder(voxel_features)
+        if return_aux:
+            return {"occupancy_logits": logits, "depth_logits": depth_logits}
+        return logits

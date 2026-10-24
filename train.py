@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader, Subset
 from data import DEFAULT_DATAROOT, NuScenesOccupancyDataset, make_dataloader, load_occupancy_labels
 from data.nuscenes_dataset import IMAGE_MEAN, IMAGE_STD
 from src.models.occupancy_model import OccupancyModel
+from data.depth_targets import DepthTargetDataset, depth_loss
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,7 +52,20 @@ def parse_args() -> argparse.Namespace:
                         help="Optional inverse-square-root class weighting, estimated from selected training labels only.")
     parser.add_argument("--xyz", action=argparse.BooleanOptionalAction, default=False,
                         help="Add normalized XYZ positional features before the unchanged decoder.")
+    parser.add_argument("--depth", action=argparse.BooleanOptionalAction, default=False,
+                        help="Enable supervised depth-conditioned lifting (new runs).")
+    parser.add_argument("--depth-bins", type=int, default=64)
+    parser.add_argument("--depth-min", type=float, default=0.1)
+    parser.add_argument("--depth-max", type=float, default=64.1)
+    parser.add_argument("--depth-loss-weight", type=float, default=1.0)
+    parser.add_argument("--depth-cache", type=Path,
+                        default=Path(__file__).resolve().parent / "outputs" / "depth_cache")
     args = parser.parse_args()
+    if (args.depth_bins <= 0 or not math.isfinite(args.depth_min)
+            or not math.isfinite(args.depth_max) or not 0 < args.depth_min < args.depth_max):
+        parser.error("Depth bins must be positive and bounds finite with 0 < min < max.")
+    if not math.isfinite(args.depth_loss_weight) or args.depth_loss_weight <= 0:
+        parser.error("--depth-loss-weight must be finite and positive.")
 
     for name in ("epochs", "batch_size"):
         if getattr(args, name) <= 0:
@@ -146,6 +160,7 @@ def train_one_epoch(
     device: torch.device,
     amp_enabled: bool,
     class_weights: torch.Tensor | None = None,
+    depth_loss_weight: float = 1.0,
 ) -> dict[str, float]:
     """Update weights and average epoch loss by its target-weight denominator.
 
@@ -160,6 +175,9 @@ def train_one_epoch(
     total_loss_weight = 0.0
     processed_batches = 0
     skipped_batches = 0
+    depth_enabled = getattr(model, "depth_head", None) is not None
+    depth_loss_sum = 0.0
+    depth_count = 0
 
     for batch_index, batch in enumerate(loader, start=1):
         images = batch["images"].to(device, non_blocking=True)
@@ -176,7 +194,11 @@ def train_one_epoch(
             continue
 
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-            logits = model(images, intrinsics, ego_to_camera)
+            if depth_enabled:
+                auxiliary = model(images, intrinsics, ego_to_camera, return_aux=True)
+                logits = auxiliary["occupancy_logits"]
+            else:
+                logits = model(images, intrinsics, ego_to_camera)
             loss = compute_loss(logits, semantics, valid_mask, class_weights)
 
         if loss is None:
@@ -185,6 +207,17 @@ def train_one_epoch(
         loss_value = loss.detach().item()
         if not math.isfinite(loss_value):
             raise FloatingPointError(f"Non-finite training loss in batch {batch_index}: {loss_value}")
+
+        if depth_enabled:
+            if "depth_target" not in batch:
+                raise ValueError("Depth training requires cached depth_target from DepthTargetDataset.")
+            auxiliary_loss, count = depth_loss(auxiliary["depth_logits"],
+                batch["depth_target"].to(device), model.depth_head.bin_edges)
+            if not torch.isfinite(auxiliary_loss):
+                raise FloatingPointError("Non-finite depth loss.")
+            depth_loss_sum += auxiliary_loss.detach().item() * count
+            depth_count += count
+            loss = loss + depth_loss_weight * auxiliary_loss
 
         # With a disabled scaler, these perform ordinary backward and step.
         # With CUDA AMP, scaling helps prevent FP16 gradient underflow.
@@ -211,8 +244,12 @@ def train_one_epoch(
 
     if total_voxels == 0:
         raise RuntimeError("Training epoch has no supervised voxels; check the data and visibility masks.")
+    if depth_enabled and depth_count == 0:
+        raise RuntimeError("No trustworthy depth targets in this epoch. Inspect target coverage before training.")
     return {
         "loss": total_loss / total_loss_weight,
+        **({"depth_loss": depth_loss_sum / depth_count, "depth_targets": depth_count}
+           if depth_enabled else {}),
         "valid_voxels": total_voxels,
         "batches": processed_batches,
         "skipped_batches": skipped_batches,
@@ -320,6 +357,9 @@ def main() -> None:
     run_validation = args.validate if args.validate is not None else args.overfit_samples == 0
 
     train_dataset = NuScenesOccupancyDataset(split="train")
+    if args.depth:
+        train_dataset = DepthTargetDataset(train_dataset, args.depth_cache,
+                                           args.depth_min, args.depth_max)
     if args.overfit_samples > len(train_dataset):
         raise ValueError(
             f"--overfit-samples exceeds the {len(train_dataset)} available training samples."
@@ -363,6 +403,10 @@ def main() -> None:
         "voxel_bounds": train_dataset.voxel_bounds,
         "voxel_chunk_size": 65536,
         "use_xyz": args.xyz,
+        "use_depth": args.depth,
+        "depth_bins": args.depth_bins,
+        "depth_min": args.depth_min,
+        "depth_max": args.depth_max,
     }
     print(
         f"Device: {device}; AMP: {amp_enabled}; training samples: {len(selected_dataset)}; "
@@ -388,6 +432,8 @@ def main() -> None:
             "class_weights": class_weights.cpu().tolist() if class_weights is not None else None,
             "training_class_counts": class_counts.tolist() if class_counts is not None else None,
             "validation_loss": "Unweighted masked cross-entropy for comparable evaluation.",
+            "depth_loss_weight": args.depth_loss_weight if args.depth else 0.0,
+            "depth_targets": "Conservative voxel-ray first-surface pseudo-depth; unknown rays masked.",
         },
         "data": {
             "dataroot": str(DEFAULT_DATAROOT),
@@ -418,6 +464,7 @@ def main() -> None:
             start = time.perf_counter()
             train_stats = train_one_epoch(
                 model, train_loader, optimizer, scaler, device, amp_enabled, class_weights,
+                depth_loss_weight=args.depth_loss_weight,
             )
             val_stats = (
                 validate(model, val_loader, device, amp_enabled)

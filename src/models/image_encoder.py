@@ -47,7 +47,7 @@ class ImageEncoder(nn.Module):
             kernel_size=1
         )
 
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
+    def forward(self, images: torch.Tensor, *, return_backbone: bool = False):
         """Return per-camera feature maps while preserving camera order."""
         if images.ndim != 5:
             raise ValueError("Expected images shaped [B, 6, 3, H, W].")
@@ -67,12 +67,14 @@ class ImageEncoder(nn.Module):
         images = images.reshape(B * N, C, H, W)
 
         # Extract spatial features and project to out_channels.
-        features = self.backbone(images)
-        features = self.projection(features)
+        backbone = self.backbone(images)
+        features = self.projection(backbone)
 
         # Restore the batch and camera dimensions.
         _, channels, h, w = features.shape
         features = features.reshape(B, N, channels, h, w)
+        if return_backbone:
+            return features, backbone.reshape(B, N, 256, h, w)
         return features
 
     def train(self, mode: bool = True):
