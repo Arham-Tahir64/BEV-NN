@@ -21,6 +21,7 @@ from data import DEFAULT_DATAROOT, NuScenesOccupancyDataset, make_dataloader, lo
 from data.nuscenes_dataset import IMAGE_MEAN, IMAGE_STD
 from src.models.occupancy_model import OccupancyModel
 from data.depth_targets import DepthTargetDataset, depth_loss
+from src.metrics import summarize_confusion
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,6 +61,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--depth-loss-weight", type=float, default=1.0)
     parser.add_argument("--depth-cache", type=Path,
                         default=Path(__file__).resolve().parent / "outputs" / "depth_cache")
+    parser.add_argument('--depth-target-mode', choices=('ray', 'projected'), default='projected')
+    parser.add_argument('--depth-fusion', choices=('legacy', 'residual'), default='residual')
+    parser.add_argument('--depth-loss-mode', choices=('hard', 'linear'), default='linear')
     args = parser.parse_args()
     if (args.depth_bins <= 0 or not math.isfinite(args.depth_min)
             or not math.isfinite(args.depth_max) or not 0 < args.depth_min < args.depth_max):
@@ -161,6 +165,7 @@ def train_one_epoch(
     amp_enabled: bool,
     class_weights: torch.Tensor | None = None,
     depth_loss_weight: float = 1.0,
+    depth_loss_mode: str = 'hard',
 ) -> dict[str, float]:
     """Update weights and average epoch loss by its target-weight denominator.
 
@@ -212,7 +217,7 @@ def train_one_epoch(
             if "depth_target" not in batch:
                 raise ValueError("Depth training requires cached depth_target from DepthTargetDataset.")
             auxiliary_loss, count = depth_loss(auxiliary["depth_logits"],
-                batch["depth_target"].to(device), model.depth_head.bin_edges)
+                batch["depth_target"].to(device), model.depth_head.bin_edges, mode=depth_loss_mode)
             if not torch.isfinite(auxiliary_loss):
                 raise FloatingPointError("Non-finite depth loss.")
             depth_loss_sum += auxiliary_loss.detach().item() * count
@@ -261,6 +266,7 @@ def validate(
     loader: DataLoader,
     device: torch.device,
     amp_enabled: bool,
+    depth_loss_mode: str = 'hard',
 ) -> dict[str, float]:
     """Return held-out masked loss and voxel accuracy without updating weights."""
     model.eval()
@@ -270,6 +276,11 @@ def validate(
     correct_voxels = 0
     processed_batches = 0
     skipped_batches = 0
+    confusion = torch.zeros(18, 18, dtype=torch.int64, device=device)
+    depth_sum = depth_abs = 0.0
+    depth_count = depth_possible = 0
+    range_counts = [0, 0, 0]
+    range_abs = [0.0, 0.0, 0.0]
 
     with torch.no_grad():
         for batch_index, batch in enumerate(loader, start=1):
@@ -285,7 +296,12 @@ def validate(
                 continue
 
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-                logits = model(images, intrinsics, ego_to_camera)
+                measure_depth = getattr(model, 'depth_head', None) is not None and 'depth_target' in batch
+                if measure_depth:
+                    auxiliary = model(images, intrinsics, ego_to_camera, return_aux=True)
+                    logits = auxiliary['occupancy_logits']
+                else:
+                    logits = model(images, intrinsics, ego_to_camera)
                 loss = compute_loss(logits, semantics, valid_mask)
             if loss is None:
                 skipped_batches += 1
@@ -296,7 +312,25 @@ def validate(
 
             total_loss += loss_value * valid_voxels
             total_voxels += valid_voxels
-            correct_voxels += int(((logits.argmax(dim=1) == semantics) & supervised).sum().item())
+            prediction = logits.argmax(dim=1)
+            correct_voxels += int(((prediction == semantics) & supervised).sum().item())
+            confusion += torch.bincount(semantics[supervised]*18 + prediction[supervised],
+                                        minlength=324).reshape(18, 18)
+            if measure_depth:
+                targets = batch['depth_target'].to(device)
+                edges = model.depth_head.bin_edges
+                auxiliary_loss, count = depth_loss(auxiliary['depth_logits'], targets, edges, mode=depth_loss_mode)
+                depth_sum += auxiliary_loss.item()*count
+                depth_count += count
+                depth_possible += targets.numel()
+                known = torch.isfinite(targets) & (targets >= edges[0]) & (targets < edges[-1])
+                depths = model.depth_head.bin_centres[auxiliary['depth_logits'].argmax(2)]
+                error = (depths-targets).abs()
+                depth_abs += error[known].sum().item()
+                for ri, (lo, hi) in enumerate(((0, 10), (10, 20), (20, float('inf')))):
+                    keep = known & (targets >= lo) & (targets < hi)
+                    range_counts[ri] += int(keep.sum().item())
+                    range_abs[ri] += error[keep].sum().item()
             processed_batches += 1
             if batch_index == 1 or batch_index % 10 == 0 or batch_index == len(loader):
                 print(
@@ -309,6 +343,13 @@ def validate(
     return {
         "loss": total_loss / total_voxels,
         "accuracy": correct_voxels / total_voxels,
+        **summarize_confusion(confusion),
+        **({'depth_loss': depth_sum/depth_count if depth_count else None,
+            'pseudo_depth_mae_m': depth_abs/depth_count if depth_count else None,
+            'depth_targets': depth_count, 'depth_target_coverage': depth_count/depth_possible,
+            'depth_range_counts_0_10_20_plus': range_counts,
+            'depth_range_mae_m': [e/n if n else None for e, n in zip(range_abs, range_counts)]}
+           if depth_possible else {}),
         "valid_voxels": total_voxels,
         "batches": processed_batches,
         "skipped_batches": skipped_batches,
@@ -340,6 +381,9 @@ def save_checkpoint(
 
 def main() -> None:
     args = parse_args()
+    # Do not overwrite an interrupted or finished experiment accidentally.
+    if any((args.output_dir / name).exists() for name in ('config.json', 'metrics.jsonl', 'latest.pt', 'best.pt')):
+        raise FileExistsError('Run directory already exists. Use resume_train.py or a new --output-dir.')
     random.seed(args.seed)
     np.random.seed(args.seed % (2 ** 32))
     torch.manual_seed(args.seed)
@@ -359,7 +403,7 @@ def main() -> None:
     train_dataset = NuScenesOccupancyDataset(split="train")
     if args.depth:
         train_dataset = DepthTargetDataset(train_dataset, args.depth_cache,
-                                           args.depth_min, args.depth_max)
+                                           args.depth_min, args.depth_max, args.depth_target_mode)
     if args.overfit_samples > len(train_dataset):
         raise ValueError(
             f"--overfit-samples exceeds the {len(train_dataset)} available training samples."
@@ -387,6 +431,9 @@ def main() -> None:
     val_loader = None
     if run_validation:
         val_dataset = NuScenesOccupancyDataset(split="val")
+        if args.depth:
+            val_dataset = DepthTargetDataset(val_dataset, args.depth_cache,
+                args.depth_min, args.depth_max, args.depth_target_mode)
         if not set(train_dataset.scene_names).isdisjoint(val_dataset.scene_names):
             raise ValueError("Training and validation scenes overlap.")
         val_loader = make_dataloader(
@@ -407,6 +454,7 @@ def main() -> None:
         "depth_bins": args.depth_bins,
         "depth_min": args.depth_min,
         "depth_max": args.depth_max,
+        "depth_fusion": args.depth_fusion,
     }
     print(
         f"Device: {device}; AMP: {amp_enabled}; training samples: {len(selected_dataset)}; "
@@ -433,7 +481,8 @@ def main() -> None:
             "training_class_counts": class_counts.tolist() if class_counts is not None else None,
             "validation_loss": "Unweighted masked cross-entropy for comparable evaluation.",
             "depth_loss_weight": args.depth_loss_weight if args.depth else 0.0,
-            "depth_targets": "Conservative voxel-ray first-surface pseudo-depth; unknown rays masked.",
+            "depth_targets": args.depth_target_mode,
+            "depth_loss_mode": args.depth_loss_mode,
         },
         "data": {
             "dataroot": str(DEFAULT_DATAROOT),
@@ -457,6 +506,7 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
     best_loss = math.inf
+    best_semantic_miou = -1.0
 
     with (args.output_dir / "metrics.jsonl").open("w", encoding="utf-8") as metrics_log:
         for epoch in range(1, args.epochs + 1):
@@ -465,18 +515,23 @@ def main() -> None:
             train_stats = train_one_epoch(
                 model, train_loader, optimizer, scaler, device, amp_enabled, class_weights,
                 depth_loss_weight=args.depth_loss_weight,
+                depth_loss_mode=args.depth_loss_mode,
             )
             val_stats = (
-                validate(model, val_loader, device, amp_enabled)
+                validate(model, val_loader, device, amp_enabled, depth_loss_mode=args.depth_loss_mode)
                 if val_loader is not None else None
             )
             selected_loss = val_stats["loss"] if val_stats is not None else train_stats["loss"]
             improved = selected_loss < best_loss
             best_loss = min(best_loss, selected_loss)
+            semantic_improved = val_stats is not None and val_stats['occupied_class_miou'] > best_semantic_miou
+            if semantic_improved:
+                best_semantic_miou = val_stats['occupied_class_miou']
             record = {
                 "epoch": epoch, "train": train_stats, "validation": val_stats,
                 "seconds": time.perf_counter() - start,
                 "selection_metric": selection_metric, "best_loss": best_loss,
+                "best_semantic_miou": best_semantic_miou,
             }
             metrics_log.write(json.dumps(record, allow_nan=False) + "\n")
             metrics_log.flush()
@@ -488,9 +543,17 @@ def main() -> None:
                 save_checkpoint(
                     args.output_dir / "best.pt", model, optimizer, scaler, epoch, checkpoint_config,
                 )
+            if semantic_improved:
+                save_checkpoint(args.output_dir / 'best_semantic.pt', model, optimizer,
+                                scaler, epoch, checkpoint_config)
             summary = f"Epoch {epoch}: train_loss={train_stats['loss']:.4f}"
             if val_stats is not None:
                 summary += f", val_loss={val_stats['loss']:.4f}, val_accuracy={val_stats['accuracy']:.3%}"
+                summary += (f", occ_mIoU={val_stats['occupied_class_miou']:.3%}, "
+                            f"manmade_IoU={val_stats['manmade_iou']:.3%}, "
+                            f"occupied_P/R={val_stats['occupied_precision']:.3%}/{val_stats['occupied_recall']:.3%}")
+                if val_stats['missing_supported_classes']:
+                    summary += f", MISSING_CLASS_IDS={val_stats['missing_supported_classes']}"
             print(summary)
 
     print(f"Finished. Logs and latest/best checkpoints: {args.output_dir}")

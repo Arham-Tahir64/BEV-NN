@@ -91,6 +91,7 @@ class TrainingRuntimeTests(unittest.TestCase):
                 overfit_samples=0, validate=None, class_balance="none", xyz=False,
                 depth=False, depth_bins=64, depth_min=0.1, depth_max=64.1,
                 depth_loss_weight=1.0, depth_cache=output / "depth_cache",
+                depth_target_mode="projected", depth_fusion="residual", depth_loss_mode="linear",
             )
             with patch("train.parse_args", return_value=args), \
                  patch("train.NuScenesOccupancyDataset", side_effect=SmallDataset), \
@@ -107,6 +108,9 @@ class TrainingRuntimeTests(unittest.TestCase):
             self.assertEqual(latest["epoch"], 2)
             self.assertEqual(latest["config"]["metrics"]["selection_metric"], "validation_loss")
             self.assertTrue((output / "best.pt").is_file())
+            semantic = torch.load(output / "best_semantic.pt", weights_only=True)
+            self.assertEqual(semantic['config']['metrics']['best_semantic_miou'],
+                             max(row['validation']['occupied_class_miou'] for row in rows))
 
 
 if __name__ == "__main__":

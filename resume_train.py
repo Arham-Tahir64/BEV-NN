@@ -79,7 +79,8 @@ def main():
         raise ValueError('Training samples differ from the checkpoint.')
     if config['model'].get('use_depth', False):
         train = DepthTargetDataset(train, settings.get('depth_cache', output.parent / 'depth_cache'),
-            config['model']['depth_min'], config['model']['depth_max'])
+            config['model']['depth_min'], config['model']['depth_max'],
+            target_mode=settings.get('depth_target_mode', 'ray'))
     selected = Subset(train, range(selected_count))
     loader = make_dataloader(selected, batch_size=settings['batch_size'], num_workers=args.workers,
                              shuffle=True, seed=seed, pin_memory=device.type == 'cuda')
@@ -89,6 +90,10 @@ def main():
             occupancy_root=metadata['occupancy_root'], image_size=tuple(metadata['image_size']), split='val')
         if tuple(val.scene_names) != tuple(metadata['validation_scenes']) or not set(train.scene_names).isdisjoint(val.scene_names):
             raise ValueError('Validation split changed or overlaps training.')
+        if config['model'].get('use_depth', False):
+            val = DepthTargetDataset(val, settings.get('depth_cache', output.parent / 'depth_cache'),
+                config['model']['depth_min'], config['model']['depth_max'],
+                target_mode=settings.get('depth_target_mode', 'ray'))
         val_loader = make_dataloader(val, batch_size=settings['batch_size'], num_workers=args.workers,
                                      shuffle=False, pin_memory=device.type == 'cuda')
 
@@ -101,6 +106,7 @@ def main():
     if amp and not saved_scaler:
         checkpoint = {**checkpoint, 'scaler_state_dict': scaler.state_dict()}
     start_epoch, best_loss = restore_training(checkpoint, model, optimizer, scaler)
+    best_semantic_miou = config['metrics'].get('best_semantic_miou', -1.0)
     weights = config.get('loss', {}).get('class_weights')
     weights = torch.tensor(weights, dtype=torch.float32, device=device) if weights is not None else None
     config = {**config, 'training': {**settings, 'epochs': args.epochs},
@@ -111,15 +117,21 @@ def main():
         for epoch in range(start_epoch, args.epochs+1):
             start = time.perf_counter()
             stats = train_one_epoch(model, loader, optimizer, scaler, device, amp, weights,
-                                    depth_loss_weight=settings.get('depth_loss_weight', 1.0))
-            val_stats = validate(model, val_loader, device, amp) if val_loader is not None else None
+                                    depth_loss_weight=settings.get('depth_loss_weight', 1.0),
+                                    depth_loss_mode=settings.get('depth_loss_mode', 'hard'))
+            val_stats = validate(model, val_loader, device, amp,
+                depth_loss_mode=settings.get('depth_loss_mode', 'hard')) if val_loader is not None else None
             loss = val_stats['loss'] if val_stats is not None else stats['loss']
             if not math.isfinite(loss):
                 raise FloatingPointError('Non-finite epoch loss.')
             improved = loss < best_loss
             best_loss = min(best_loss, loss)
+            semantic_improved = val_stats is not None and val_stats['occupied_class_miou'] > best_semantic_miou
+            if semantic_improved:
+                best_semantic_miou = val_stats['occupied_class_miou']
             record = dict(epoch=epoch, train=stats, validation=val_stats,
-                seconds=time.perf_counter()-start, selection_metric=config['selection_metric'], best_loss=best_loss)
+                seconds=time.perf_counter()-start, selection_metric=config['selection_metric'], best_loss=best_loss,
+                best_semantic_miou=best_semantic_miou)
             state_config = {**config, 'metrics': record}
             # Match the original run's log/checkpoint order. A crash between
             # these operations is detected by check_log on the next resume.
@@ -128,7 +140,13 @@ def main():
             save_checkpoint(output / 'latest.pt', model, optimizer, scaler, epoch, state_config)
             if improved:
                 save_checkpoint(output / 'best.pt', model, optimizer, scaler, epoch, state_config)
+            if semantic_improved:
+                save_checkpoint(output / 'best_semantic.pt', model, optimizer, scaler, epoch, state_config)
             print(f'Epoch {epoch}/{args.epochs}: selected loss={loss:.6f}', flush=True)
+            if val_stats is not None:
+                print(f"Occupied mIoU={val_stats['occupied_class_miou']:.3%}; "
+                      f"manmade IoU={val_stats['manmade_iou']:.3%}; "
+                      f"missing class IDs={val_stats['missing_supported_classes']}", flush=True)
 
 
 if __name__ == '__main__':

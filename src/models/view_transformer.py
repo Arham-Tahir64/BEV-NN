@@ -20,6 +20,8 @@ class ViewTransformer(nn.Module):
 
     Output:
         Voxel features [B, C, X, Y, Z], in the labels' [X, Y, Z] axis order.
+        Residual depth fusion returns [B, 2*C+1, X, Y, Z]: original context,
+        depth-weighted context, and scalar support, for a learned projection.
 
     Default Occ3D grid:
         Shape: (200, 200, 16).
@@ -237,6 +239,7 @@ class ViewTransformer(nn.Module):
         image_size: tuple[int, int],
         *, depth_probs: torch.Tensor | None = None,
         depth_edges: torch.Tensor | None = None,
+        depth_fusion: str = 'legacy',
     ) -> torch.Tensor:
         """Lift per-camera features into [B,C,X,Y,Z] voxel features.
 
@@ -265,6 +268,11 @@ class ViewTransformer(nn.Module):
             raise TypeError("Features and camera calibration must be floating-point tensors.")
         if not (features.device == intrinsics.device == ego_to_camera.device):
             raise ValueError("Features and camera calibration must be on the same device.")
+
+        if depth_fusion not in ('legacy', 'residual'):
+            raise ValueError('Unknown depth fusion mode.')
+        if depth_fusion == 'residual' and depth_probs is None:
+            raise ValueError('Residual fusion requires depth probabilities.')
 
         if depth_probs is not None:
             if (depth_probs.ndim != 5 or depth_probs.shape[:2] != (batch_size, cameras)
@@ -295,16 +303,27 @@ class ViewTransformer(nn.Module):
                     centres, intrinsics, ego_to_camera, image_size
                 )
             sampled = self.sample_features(features, pixels, image_size)
+            context = self.fuse_features(sampled, valid) if depth_fusion == 'residual' else None
             if depth_probs is not None:
                 with torch.autocast(device_type=features.device.type, enabled=False):
                     depths = torch.einsum("bnj,vj->bnv", ego_to_camera[..., 2, :3],
                                           centres.to(geometry_dtype)) + ego_to_camera[..., 2, 3, None]
                 support = self.sample_depth_support(depth_probs, pixels, depths, depth_edges)
+                if depth_fusion == 'residual':
+                    # Uniform depth is neutral (D*p=1); limit amplification by
+                    # overconfident pseudo-depth. Keep raw context in a separate
+                    # branch so unsupported surfaces retain visual evidence.
+                    support = (support * depth_probs.shape[2]).clamp(max=4.0)
                 sampled = sampled * support.unsqueeze(2).to(sampled.dtype)
                 # Retain the geometric-view-count denominator. Normalizing by
                 # support would cancel the gate for a single contributing view.
-            fused_chunks.append(self.fuse_features(sampled, valid))
+            fused = self.fuse_features(sampled, valid)
+            if depth_fusion == 'residual':
+                evidence = self.fuse_features(support.unsqueeze(2).to(sampled.dtype), valid)
+                fused = torch.cat((context, fused, evidence), dim=1)
+            fused_chunks.append(fused)
 
         # Concatenation preserves gradients and the original [X,Y,Z] order.
         fused = torch.cat(fused_chunks, dim=-1)  # [B,C,V]
-        return fused.reshape(batch_size, channels, *self.grid_shape)
+        output_channels = 2*channels+1 if depth_fusion == 'residual' else channels
+        return fused.reshape(batch_size, output_channels, *self.grid_shape)

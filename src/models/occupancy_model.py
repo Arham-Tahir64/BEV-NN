@@ -49,6 +49,7 @@ class OccupancyModel(nn.Module):
         depth_bins: int = 64,
         depth_min: float = 0.1,
         depth_max: float = 64.1,
+        depth_fusion: str = 'legacy',
     ) -> None:
         super().__init__()
 
@@ -90,6 +91,20 @@ class OccupancyModel(nn.Module):
         # Opt-in: old configurations retain identical parameters and outputs.
         self.depth_head = DepthHead(num_bins=depth_bins, min_depth=depth_min,
                                     max_depth=depth_max) if use_depth else None
+        if depth_fusion not in ('legacy', 'residual'):
+            raise ValueError('Unknown depth fusion mode.')
+        self.depth_fusion = depth_fusion
+        self.depth_context_projection = None
+        if use_depth and depth_fusion == 'residual':
+            self.depth_context_projection = nn.Conv3d(2*feature_channels+1, feature_channels, 1)
+            # Start close to the original context scale; learn how to use the
+            # gated branch and explicit support. No new state for legacy models.
+            with torch.no_grad():
+                self.depth_context_projection.weight.zero_()
+                self.depth_context_projection.bias.zero_()
+                for c in range(feature_channels):
+                    self.depth_context_projection.weight[c, c, 0, 0, 0] = .9
+                    self.depth_context_projection.weight[c, c+feature_channels, 0, 0, 0] = .1
 
 
     def forward(
@@ -122,10 +137,13 @@ class OccupancyModel(nn.Module):
         depth_args = {} if depth_logits is None else {
             "depth_probs": depth_logits.float().softmax(dim=2),
             "depth_edges": self.depth_head.bin_edges,
+            "depth_fusion": self.depth_fusion,
         }
         voxel_features = self.view_transformer(
             image_features, intrinsics, ego_to_camera, image_size, **depth_args
         )  # [B,C,X,Y,Z]
+        if self.depth_context_projection is not None:
+            voxel_features = self.depth_context_projection(voxel_features)
         if self.xyz_projection is not None:
             # The same ego-frame coordinate grid applies to every batch item.
             # Zero initialization starts from the image-only baseline; training
