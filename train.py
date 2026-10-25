@@ -22,6 +22,8 @@ from data.nuscenes_dataset import IMAGE_MEAN, IMAGE_STD
 from src.models.occupancy_model import OccupancyModel
 from data.depth_targets import DepthTargetDataset, depth_loss
 from src.metrics import summarize_confusion
+from src.losses import occupied_free_loss
+from data.scene_selection import read_scene_list
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,14 +64,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--depth-cache", type=Path,
                         default=Path(__file__).resolve().parent / "outputs" / "depth_cache")
     parser.add_argument('--depth-target-mode', choices=('ray', 'projected'), default='projected')
-    parser.add_argument('--depth-fusion', choices=('legacy', 'residual'), default='residual')
+    parser.add_argument('--depth-fusion', choices=('legacy', 'residual', 'gated'), default='residual',
+                        help='gated tests scaled depth-dependent appearance without a raw context branch.')
     parser.add_argument('--depth-loss-mode', choices=('hard', 'linear'), default='linear')
+    parser.add_argument('--geometry-loss-weight', type=float, default=0.0,
+                        help='Weight of unweighted occupied/free BCE on existing logits; 0 disables it.')
+    parser.add_argument('--dataset-version', choices=('v1.0-mini','v1.0-trainval'), default='v1.0-mini')
+    parser.add_argument('--dataroot', type=Path, default=DEFAULT_DATAROOT,
+                        help='nuScenes root containing the selected metadata version.')
+    parser.add_argument('--occupancy-root', type=Path, help='Occ3D gts directory.')
+    parser.add_argument('--image-root', type=Path,
+                        help='Optional keyframe images root containing CAM_* folders (e.g. Occ3D imgs).')
+    parser.add_argument('--annotations-json', type=Path,
+                        help='Official Occ3D annotations.json; supplies camera/pose metadata directly.')
+    parser.add_argument('--train-scenes', type=Path, help='JSON scene-name list within the official training split.')
+    parser.add_argument('--val-scenes', type=Path, help='JSON scene-name list within the official validation split.')
     args = parser.parse_args()
+    if args.depth_fusion == 'gated' and not args.depth:
+        parser.error('--depth-fusion gated requires --depth.')
     if (args.depth_bins <= 0 or not math.isfinite(args.depth_min)
             or not math.isfinite(args.depth_max) or not 0 < args.depth_min < args.depth_max):
         parser.error("Depth bins must be positive and bounds finite with 0 < min < max.")
     if not math.isfinite(args.depth_loss_weight) or args.depth_loss_weight <= 0:
         parser.error("--depth-loss-weight must be finite and positive.")
+    if not math.isfinite(args.geometry_loss_weight) or args.geometry_loss_weight < 0:
+        parser.error('--geometry-loss-weight must be finite and nonnegative.')
 
     for name in ("epochs", "batch_size"):
         if getattr(args, name) <= 0:
@@ -166,6 +185,7 @@ def train_one_epoch(
     class_weights: torch.Tensor | None = None,
     depth_loss_weight: float = 1.0,
     depth_loss_mode: str = 'hard',
+    geometry_loss_weight: float = 0.0,
 ) -> dict[str, float]:
     """Update weights and average epoch loss by its target-weight denominator.
 
@@ -174,6 +194,8 @@ def train_one_epoch(
     RuntimeError rather than reporting a misleading zero loss.
     """
     model.train()  # ImageEncoder.train() keeps its frozen backbone in eval mode.
+    if not math.isfinite(geometry_loss_weight) or geometry_loss_weight < 0:
+        raise ValueError('geometry_loss_weight must be finite and nonnegative.')
     use_amp = amp_enabled and device.type == "cuda"
     total_loss = 0.0
     total_voxels = 0
@@ -183,6 +205,8 @@ def train_one_epoch(
     depth_enabled = getattr(model, "depth_head", None) is not None
     depth_loss_sum = 0.0
     depth_count = 0
+    geometry_sum = 0.0
+    geometry_count = 0
 
     for batch_index, batch in enumerate(loader, start=1):
         images = batch["images"].to(device, non_blocking=True)
@@ -212,6 +236,14 @@ def train_one_epoch(
         loss_value = loss.detach().item()
         if not math.isfinite(loss_value):
             raise FloatingPointError(f"Non-finite training loss in batch {batch_index}: {loss_value}")
+
+        if geometry_loss_weight > 0:
+            geometry, count = occupied_free_loss(logits, semantics, valid_mask)
+            if not torch.isfinite(geometry):
+                raise FloatingPointError('Non-finite occupied/free loss.')
+            geometry_sum += geometry.detach().item()*count
+            geometry_count += count
+            loss = loss + geometry_loss_weight*geometry
 
         if depth_enabled:
             if "depth_target" not in batch:
@@ -255,6 +287,8 @@ def train_one_epoch(
         "loss": total_loss / total_loss_weight,
         **({"depth_loss": depth_loss_sum / depth_count, "depth_targets": depth_count}
            if depth_enabled else {}),
+        **({'geometry_loss': geometry_sum/geometry_count, 'geometry_voxels': geometry_count}
+           if geometry_count else {}),
         "valid_voxels": total_voxels,
         "batches": processed_batches,
         "skipped_batches": skipped_batches,
@@ -281,6 +315,7 @@ def validate(
     depth_count = depth_possible = 0
     range_counts = [0, 0, 0]
     range_abs = [0.0, 0.0, 0.0]
+    geometry_sum = 0.0
 
     with torch.no_grad():
         for batch_index, batch in enumerate(loader, start=1):
@@ -311,6 +346,8 @@ def validate(
                 raise FloatingPointError(f"Non-finite validation loss in batch {batch_index}: {loss_value}")
 
             total_loss += loss_value * valid_voxels
+            geometry, _ = occupied_free_loss(logits, semantics, valid_mask)
+            geometry_sum += geometry.item()*valid_voxels
             total_voxels += valid_voxels
             prediction = logits.argmax(dim=1)
             correct_voxels += int(((prediction == semantics) & supervised).sum().item())
@@ -343,6 +380,7 @@ def validate(
     return {
         "loss": total_loss / total_voxels,
         "accuracy": correct_voxels / total_voxels,
+        'geometry_loss': geometry_sum/total_voxels,
         **summarize_confusion(confusion),
         **({'depth_loss': depth_sum/depth_count if depth_count else None,
             'pseudo_depth_mae_m': depth_abs/depth_count if depth_count else None,
@@ -400,7 +438,12 @@ def main() -> None:
     amp_enabled = args.amp and device.type == "cuda"
     run_validation = args.validate if args.validate is not None else args.overfit_samples == 0
 
-    train_dataset = NuScenesOccupancyDataset(split="train")
+    dataset_options = dict(dataroot=args.dataroot, occupancy_root=args.occupancy_root,
+                           version=args.dataset_version, image_root=args.image_root,
+                           annotations_json=args.annotations_json)
+    print(f'Indexing {args.dataset_version} training scenes...',flush=True)
+    train_dataset = NuScenesOccupancyDataset(split="train", **dataset_options,
+                                            scene_names=read_scene_list(args.train_scenes))
     if args.depth:
         train_dataset = DepthTargetDataset(train_dataset, args.depth_cache,
                                            args.depth_min, args.depth_max, args.depth_target_mode)
@@ -430,7 +473,9 @@ def main() -> None:
     val_dataset = None
     val_loader = None
     if run_validation:
-        val_dataset = NuScenesOccupancyDataset(split="val")
+        print(f'Indexing {args.dataset_version} validation scenes...',flush=True)
+        val_dataset = NuScenesOccupancyDataset(split="val", **dataset_options,
+                                              scene_names=read_scene_list(args.val_scenes))
         if args.depth:
             val_dataset = DepthTargetDataset(val_dataset, args.depth_cache,
                 args.depth_min, args.depth_max, args.depth_target_mode)
@@ -457,6 +502,7 @@ def main() -> None:
         "depth_fusion": args.depth_fusion,
     }
     print(
+        f"Dataset: {args.dataset_version}; training scenes: {len(train_dataset.scene_names)}; "
         f"Device: {device}; AMP: {amp_enabled}; training samples: {len(selected_dataset)}; "
         f"validation: {run_validation}"
     )
@@ -483,9 +529,14 @@ def main() -> None:
             "depth_loss_weight": args.depth_loss_weight if args.depth else 0.0,
             "depth_targets": args.depth_target_mode,
             "depth_loss_mode": args.depth_loss_mode,
+            'geometry_loss_weight': args.geometry_loss_weight,
+            'geometry_loss': 'Unweighted observed-voxel occupied/free BCE; free=17, unknown ignored.',
         },
         "data": {
-            "dataroot": str(DEFAULT_DATAROOT),
+            "dataroot": str(args.dataroot.expanduser().resolve()),
+            'version': args.dataset_version,
+            'image_root': str(args.image_root.expanduser().resolve()) if args.image_root is not None else None,
+            'annotations_json': str(args.annotations_json.expanduser().resolve()) if args.annotations_json is not None else None,
             "occupancy_root": str(train_dataset.occupancy_root),
             "image_size": train_dataset.image_size,
             "image_mean": IMAGE_MEAN,
@@ -516,6 +567,7 @@ def main() -> None:
                 model, train_loader, optimizer, scaler, device, amp_enabled, class_weights,
                 depth_loss_weight=args.depth_loss_weight,
                 depth_loss_mode=args.depth_loss_mode,
+                geometry_loss_weight=args.geometry_loss_weight,
             )
             val_stats = (
                 validate(model, val_loader, device, amp_enabled, depth_loss_mode=args.depth_loss_mode)
@@ -547,6 +599,8 @@ def main() -> None:
                 save_checkpoint(args.output_dir / 'best_semantic.pt', model, optimizer,
                                 scaler, epoch, checkpoint_config)
             summary = f"Epoch {epoch}: train_loss={train_stats['loss']:.4f}"
+            if 'geometry_loss' in train_stats:
+                summary += f", geometry_BCE={train_stats['geometry_loss']:.4f}"
             if val_stats is not None:
                 summary += f", val_loss={val_stats['loss']:.4f}, val_accuracy={val_stats['accuracy']:.3%}"
                 summary += (f", occ_mIoU={val_stats['occupied_class_miou']:.3%}, "

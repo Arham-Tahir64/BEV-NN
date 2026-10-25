@@ -18,9 +18,14 @@ def load_nuscenes(
     dataroot: str | Path = DEFAULT_DATAROOT,
     version: str = "v1.0-mini",
     verbose: bool = True,
+    annotations_json: str | Path | None = None,
+    image_root: str | Path | None = None,
 ) -> NuScenes:
     """Load the official devkit database; dataroot contains samples and metadata."""
     root = Path(dataroot).expanduser().resolve()
+    if annotations_json is not None:
+        from .occ3d_metadata import Occ3DMetadata
+        return Occ3DMetadata(annotations_json,root,version,image_root)
     if not (root / version / "scene.json").is_file():
         raise FileNotFoundError(
             f"Missing nuScenes metadata: {root / version / 'scene.json'}. "
@@ -131,26 +136,26 @@ class NuScenesOccupancyDataset(Dataset):
     voxel_bounds = (-40., -40., -1., 40., 40., 5.4)
 
     def __init__(self, dataroot=DEFAULT_DATAROOT, occupancy_root=None,
-                 version="v1.0-mini", split="train", image_size=(320, 576), nusc=None):
-        from nuscenes.utils.splits import create_splits_scenes
+                 version="v1.0-mini", split="train", image_size=(320, 576), nusc=None,
+                 scene_names=None, image_root=None, annotations_json=None):
+        from .scene_selection import split_scene_names
         from .occupancy_labels import DEFAULT_OCCUPANCY_ROOT
         from .voxel_projection import camera_geometry, occupancy_label_path
 
         if len(image_size) != 2 or any(not isinstance(d, int) or isinstance(d, bool) or d <= 0 for d in image_size):
             raise ValueError("image_size must be two positive integers (height, width).")
-        if version not in ("v1.0-mini", "v1.0-trainval"):
-            raise ValueError("Training labels require v1.0-mini or v1.0-trainval.")
-        valid_splits = ("train", "val", "mini_train", "mini_val") if version == "v1.0-mini" else ("train", "val")
-        if split not in valid_splits:
-            raise ValueError(f"Choose one of {valid_splits} for {version}.")
-        split_name = f"mini_{split}" if version == "v1.0-mini" and split in ("train", "val") else split
+        split_name, selected_names = split_scene_names(version, split, scene_names)
+        self.version = version
+        self.dataroot = Path(dataroot).expanduser().resolve()
+        self.image_root = Path(image_root).expanduser().resolve() if image_root is not None else None
         self.split = split_name
         self.image_size = tuple(image_size)
         self.occupancy_root = Path(occupancy_root or DEFAULT_OCCUPANCY_ROOT).expanduser().resolve()
-        nusc = nusc if nusc is not None else load_nuscenes(dataroot, version, verbose=False)
+        nusc = nusc if nusc is not None else load_nuscenes(dataroot, version, verbose=False,
+            annotations_json=annotations_json,image_root=image_root)
         if nusc.version != version:
             raise ValueError(f"Metadata version {nusc.version} does not match requested {version}.")
-        wanted = set(create_splits_scenes()[split_name])
+        wanted = set(selected_names)
         scenes = [scene for scene in nusc.scene if scene["name"] in wanted]
         missing_scenes = wanted - {scene["name"] for scene in scenes}
         if missing_scenes:
@@ -169,6 +174,8 @@ class NuScenesOccupancyDataset(Dataset):
                 paths, intrinsics, transforms = [], [], []
                 for channel in self.camera_order:
                     path = Path(nusc.get_sample_data_path(sample["data"][channel]))
+                    if self.image_root is not None:
+                        path = self.image_root / channel / path.name
                     if not path.is_file():
                         raise FileNotFoundError(f"Missing camera image: {path}")
                     camera = geometry[channel]

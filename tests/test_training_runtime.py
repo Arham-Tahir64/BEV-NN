@@ -25,7 +25,7 @@ class SmallDataset(Dataset):
     ignore_index = 255
     occupancy_root = Path("unused")
 
-    def __init__(self, split):
+    def __init__(self, split, **kwargs):
         self.scene_names = (f"{split}-scene",)
         self.records = [{"sample_token": f"{split}-{i}"} for i in range(2 if split == "train" else 1)]
 
@@ -92,6 +92,9 @@ class TrainingRuntimeTests(unittest.TestCase):
                 depth=False, depth_bins=64, depth_min=0.1, depth_max=64.1,
                 depth_loss_weight=1.0, depth_cache=output / "depth_cache",
                 depth_target_mode="projected", depth_fusion="residual", depth_loss_mode="linear",
+                geometry_loss_weight=0.5,
+                dataset_version='v1.0-mini', dataroot=Path('unused'), occupancy_root=None,
+                image_root=None, train_scenes=None, val_scenes=None, annotations_json=None,
             )
             with patch("train.parse_args", return_value=args), \
                  patch("train.NuScenesOccupancyDataset", side_effect=SmallDataset), \
@@ -101,11 +104,15 @@ class TrainingRuntimeTests(unittest.TestCase):
             config = json.loads((output / "config.json").read_text())
             self.assertEqual(config["selection_metric"], "validation_loss")
             self.assertFalse(config["amp_enabled"])
+            self.assertEqual(config['training']['geometry_loss_weight'],.5)
+            self.assertEqual(config['loss']['geometry_loss_weight'],.5)
             rows = [json.loads(line) for line in (output / "metrics.jsonl").read_text().splitlines()]
             self.assertEqual(len(rows), 2)
             self.assertTrue(all(row["validation"]["valid_voxels"] == 2 for row in rows))
+            self.assertTrue(all(row['train']['geometry_voxels']==4 for row in rows))
             latest = torch.load(output / "latest.pt", weights_only=True)
             self.assertEqual(latest["epoch"], 2)
+            self.assertEqual(latest['config']['training']['geometry_loss_weight'],.5)
             self.assertEqual(latest["config"]["metrics"]["selection_metric"], "validation_loss")
             self.assertTrue((output / "best.pt").is_file())
             semantic = torch.load(output / "best_semantic.pt", weights_only=True)

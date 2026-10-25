@@ -91,8 +91,10 @@ class OccupancyModel(nn.Module):
         # Opt-in: old configurations retain identical parameters and outputs.
         self.depth_head = DepthHead(num_bins=depth_bins, min_depth=depth_min,
                                     max_depth=depth_max) if use_depth else None
-        if depth_fusion not in ('legacy', 'residual'):
+        if depth_fusion not in ('legacy', 'residual', 'gated'):
             raise ValueError('Unknown depth fusion mode.')
+        if depth_fusion == 'gated' and not use_depth:
+            raise ValueError('Gated fusion requires use_depth=True.')
         self.depth_fusion = depth_fusion
         self.depth_context_projection = None
         if use_depth and depth_fusion == 'residual':
@@ -105,6 +107,15 @@ class OccupancyModel(nn.Module):
                 for c in range(feature_channels):
                     self.depth_context_projection.weight[c, c, 0, 0, 0] = .9
                     self.depth_context_projection.weight[c, c+feature_channels, 0, 0, 0] = .1
+        elif use_depth and depth_fusion == 'gated':
+            self.depth_context_projection = nn.Conv3d(feature_channels+1, feature_channels, 1)
+            # Identity on gated context; support starts with zero weight.
+            # Uniform depth therefore preserves the original feature scale.
+            with torch.no_grad():
+                self.depth_context_projection.weight.zero_()
+                self.depth_context_projection.bias.zero_()
+                for c in range(feature_channels):
+                    self.depth_context_projection.weight[c, c, 0, 0, 0] = 1.
 
 
     def forward(

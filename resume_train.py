@@ -67,7 +67,9 @@ def main():
     torch.manual_seed(seed)
 
     train = NuScenesOccupancyDataset(dataroot=metadata['dataroot'],
-        occupancy_root=metadata['occupancy_root'], image_size=tuple(metadata['image_size']), split='train')
+        occupancy_root=metadata['occupancy_root'], image_size=tuple(metadata['image_size']), split='train',
+        version=metadata.get('version','v1.0-mini'), image_root=metadata.get('image_root'),
+        scene_names=metadata['train_scenes'], annotations_json=metadata.get('annotations_json'))
     for key, actual in (('grid_shape', train.grid_shape), ('voxel_bounds', train.voxel_bounds)):
         if tuple(config['model'][key]) != tuple(actual):
             raise ValueError(f'Checkpoint {key} does not match dataset.')
@@ -87,7 +89,9 @@ def main():
     val_loader = None
     if config['selection_metric'] == 'validation_loss':
         val = NuScenesOccupancyDataset(dataroot=metadata['dataroot'],
-            occupancy_root=metadata['occupancy_root'], image_size=tuple(metadata['image_size']), split='val')
+            occupancy_root=metadata['occupancy_root'], image_size=tuple(metadata['image_size']), split='val',
+            version=metadata.get('version','v1.0-mini'), image_root=metadata.get('image_root'),
+            scene_names=metadata['validation_scenes'], annotations_json=metadata.get('annotations_json'))
         if tuple(val.scene_names) != tuple(metadata['validation_scenes']) or not set(train.scene_names).isdisjoint(val.scene_names):
             raise ValueError('Validation split changed or overlaps training.')
         if config['model'].get('use_depth', False):
@@ -118,7 +122,8 @@ def main():
             start = time.perf_counter()
             stats = train_one_epoch(model, loader, optimizer, scaler, device, amp, weights,
                                     depth_loss_weight=settings.get('depth_loss_weight', 1.0),
-                                    depth_loss_mode=settings.get('depth_loss_mode', 'hard'))
+                                    depth_loss_mode=settings.get('depth_loss_mode', 'hard'),
+                                    geometry_loss_weight=settings.get('geometry_loss_weight', 0.0))
             val_stats = validate(model, val_loader, device, amp,
                 depth_loss_mode=settings.get('depth_loss_mode', 'hard')) if val_loader is not None else None
             loss = val_stats['loss'] if val_stats is not None else stats['loss']

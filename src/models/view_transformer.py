@@ -20,6 +20,8 @@ class ViewTransformer(nn.Module):
 
     Output:
         Voxel features [B, C, X, Y, Z], in the labels' [X, Y, Z] axis order.
+        Residual depth fusion returns 2*C+1 channels (raw, gated, support).
+        Gated depth fusion returns C+1 channels (gated, support).
         Residual depth fusion returns [B, 2*C+1, X, Y, Z]: original context,
         depth-weighted context, and scalar support, for a learned projection.
 
@@ -269,10 +271,10 @@ class ViewTransformer(nn.Module):
         if not (features.device == intrinsics.device == ego_to_camera.device):
             raise ValueError("Features and camera calibration must be on the same device.")
 
-        if depth_fusion not in ('legacy', 'residual'):
+        if depth_fusion not in ('legacy', 'residual', 'gated'):
             raise ValueError('Unknown depth fusion mode.')
-        if depth_fusion == 'residual' and depth_probs is None:
-            raise ValueError('Residual fusion requires depth probabilities.')
+        if depth_fusion in ('residual', 'gated') and depth_probs is None:
+            raise ValueError('Depth fusion requires depth probabilities.')
 
         if depth_probs is not None:
             if (depth_probs.ndim != 5 or depth_probs.shape[:2] != (batch_size, cameras)
@@ -309,7 +311,7 @@ class ViewTransformer(nn.Module):
                     depths = torch.einsum("bnj,vj->bnv", ego_to_camera[..., 2, :3],
                                           centres.to(geometry_dtype)) + ego_to_camera[..., 2, 3, None]
                 support = self.sample_depth_support(depth_probs, pixels, depths, depth_edges)
-                if depth_fusion == 'residual':
+                if depth_fusion in ('residual', 'gated'):
                     # Uniform depth is neutral (D*p=1); limit amplification by
                     # overconfident pseudo-depth. Keep raw context in a separate
                     # branch so unsupported surfaces retain visual evidence.
@@ -321,9 +323,15 @@ class ViewTransformer(nn.Module):
             if depth_fusion == 'residual':
                 evidence = self.fuse_features(support.unsqueeze(2).to(sampled.dtype), valid)
                 fused = torch.cat((context, fused, evidence), dim=1)
+            elif depth_fusion == 'gated':
+                # Keep depth evidence explicit without any ungated appearance
+                # path. Geometric view counts retain the gate in single views.
+                evidence = self.fuse_features(support.unsqueeze(2).to(sampled.dtype), valid)
+                fused = torch.cat((fused, evidence), dim=1)
             fused_chunks.append(fused)
 
         # Concatenation preserves gradients and the original [X,Y,Z] order.
         fused = torch.cat(fused_chunks, dim=-1)  # [B,C,V]
-        output_channels = 2*channels+1 if depth_fusion == 'residual' else channels
+        output_channels = {'legacy': channels, 'residual': 2*channels+1,
+                           'gated': channels+1}[depth_fusion]
         return fused.reshape(batch_size, output_channels, *self.grid_shape)

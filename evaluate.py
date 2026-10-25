@@ -208,6 +208,9 @@ def main():
     dataset = NuScenesOccupancyDataset(
         dataroot=metadata["dataroot"], occupancy_root=metadata["occupancy_root"],
         split=args.split, image_size=tuple(metadata["image_size"]),
+        version=metadata.get('version','v1.0-mini'), image_root=metadata.get('image_root'),
+        annotations_json=metadata.get('annotations_json'),
+        scene_names=(metadata['train_scenes'] if args.split=='train' else metadata['validation_scenes']) or None,
     )
     if tuple(config["model"]["grid_shape"]) != dataset.grid_shape:
         raise ValueError("Checkpoint and annotation grid shapes differ.")

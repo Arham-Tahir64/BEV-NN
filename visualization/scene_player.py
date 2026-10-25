@@ -73,10 +73,13 @@ class SceneEngine:
             self.split = "train"
         else:
             raise ValueError("Scene is not in the checkpoint's train or validation split.")
-        nusc = load_nuscenes(metadata["dataroot"], verbose=False)
+        version = metadata.get('version','v1.0-mini')
+        nusc = load_nuscenes(metadata["dataroot"], version=version, verbose=False,
+            annotations_json=metadata.get('annotations_json'),image_root=metadata.get('image_root'))
         self.dataset = NuScenesOccupancyDataset(
             dataroot=metadata["dataroot"], occupancy_root=metadata["occupancy_root"],
             split=self.split, image_size=tuple(metadata["image_size"]), nusc=nusc,
+            version=version, image_root=metadata.get('image_root'), scene_names=[scene_name],
         )
         if tuple(self.config["model"]["grid_shape"]) != self.dataset.grid_shape:
             raise ValueError("Checkpoint grid shape does not match the dataset.")
