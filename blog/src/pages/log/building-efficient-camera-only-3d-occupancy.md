@@ -1,11 +1,11 @@
 ---
 layout: ../../layouts/Post.astro
 title: "Building an efficient camera-only 3D occupancy model"
-description: "Building a camera-to-voxel model, inspecting its first predictions, and investigating depth ambiguity with FPN features and BEVDepth-inspired lifting."
+description: "From geometric lifting to a fuller BEVDepth-style occupancy model: less ray smearing, more recovered structure, better-looking height, and remaining errors at distance."
 date: "2026-10-21"
-lastUpdated: "2026-10-23"
+lastUpdated: "2026-10-26"
 number: "01"
-status: "Investigating depth ambiguity"
+status: "BEVDepth visual results"
 tags: ["3D perception", "PyTorch", "Edge deployment"]
 ---
 
@@ -13,7 +13,7 @@ I’m building a camera-only 3D semantic occupancy network, and I’m documentin
 
 That means predicting a 3D grid containing roads, vehicles, pedestrians, and other scene elements. It also means learning enough computer vision to understand why a particular architecture works, rather than just getting someone else’s model to run.
 
-> **Updated October 23, 2026:** the model and training entry point are implemented. Sections 01–07 preserve my original design notes from October 21; sections 08–10 record the first implementation and all-free diagnostic. The [latest visualization](#11-latest-visualization-where-does-a-surface-start-and-end) now shows occupied predictions with stretched geometry, shifting my investigation toward depth ambiguity and occlusion. These images are qualitative snapshots, not a controlled benchmark or proof of a single failure cause.
+> **Updated October 26, 2026:** the [new BEVDepth-style implementation and two result views](#13-from-lightweight-depth-to-a-fuller-bevdepth-architecture) show much less ray smearing, more recovered occupied structure, and better-looking object heights. Distant smearing still appears in playback and improves as the ego car gets closer. Earlier sections preserve the design and implementation history; the visual improvements are observations, not numerical accuracy gains inferred from screenshots.
 
 ## 01. Learning the fundamentals
 
@@ -306,6 +306,83 @@ The experiment I want to investigate is predicting a distribution over candidate
 I want to compare the existing geometric baseline, an FPN-only feature variant, and a depth-aware variant while keeping the data split and evaluation masks fixed. The checks should include occupied IoU, per-class semantic IoU, boundary quality, and the extent of ray-like errors, alongside depth quality where targets are available, memory use, and latency. That would help distinguish the benefit of richer image features from the benefit of explicit depth information.
 
 For now, the question driving the next iteration is: **can depth-aware lifting reduce the ambiguity about where image evidence belongs in 3D, without losing the efficiency that motivated this baseline?**
+
+## 13. From lightweight depth to a fuller BEVDepth architecture
+
+**October 26, 2026 — implementation and visual results.** Since the last update, I implemented a lightweight BEVDepth-inspired depth path. Ray smearing was still present, so I moved on to a fuller BEVDepth-style architecture adapted to 3D semantic occupancy. The two screenshots below are results from that newer implementation.
+
+The biggest visual change is that the predictions are less stretched along camera rays. More of the occupied scene is being recovered, and the vertical extent of objects looks much closer to the ground truth. The remaining errors are now especially noticeable at a distance rather than dominating the entire scene.
+
+### What changed beyond the lightweight depth head
+
+The earlier depth path added a small depth classifier to frozen image features and used depth-conditioned inverse sampling into the voxel grid. That was a useful first experiment, but adding depth probabilities alone did not make the predictions spatially reliable. A broad or misplaced depth distribution can still spread appearance over multiple distances.
+
+The newer `bevdepth` architecture changes several parts of the pipeline together:
+
+| Stage | Fuller implementation |
+| --- | --- |
+| Image features | Trainable ResNet-18 residual stages, with four image scales aligned and fused at stride 16; the stem stays frozen and ImageNet BatchNorm statistics stay fixed |
+| Depth and context | Separate camera-conditioned branches using calibration descriptors and channel gates |
+| Depth estimation | Residual blocks, multi-scale dilated context through ASPP, deformable convolution, and a depth-bin classifier |
+| Lifting | Multiply context features by their depth probabilities before placing them in 3D |
+| Frustum refinement | Refine the depth-weighted features across depth and image width before voxel pooling |
+| Voxel placement | Forward-unproject frustum samples through calibration and sum them into their destination voxels while retaining height |
+| Occupancy decoding | A multi-scale residual 3D decoder with two XY downsampling stages and skip fusion back to the full grid; all 16 height layers remain |
+
+```text
+Six camera images + calibration
+    ↓
+Multi-scale image features
+    ↓
+Camera-conditioned depth + context branches
+    ↓
+Depth probabilities × context features
+    ↓
+Frustum refinement → forward voxel pooling
+    ↓
+Multi-scale 3D decoder → 18 occupancy class logits
+```
+
+This also brings U-Net-style multi-resolution processing and skip connections into the occupancy decoder, replacing the two plain 3D convolution layers used by the original baseline in this architecture mode.
+
+By “fuller BEVDepth” here, I mean adopting its depth/context/refinement structure rather than adding only a lightweight depth head. This is still an occupancy adaptation, not an exact reproduction of the published detector: it uses narrower ResNet-18-based features, native PyTorch pooling, and a height-preserving occupancy decoder instead of the reference BEV detection output. The implementation and these differences are recorded in [BEVDEPTH_STRUCTURE.md at revision c932fb6](https://github.com/Arham-Tahir64/BEV-NN/blob/c932fb6/BEVDEPTH_STRUCTURE.md), with the components in [bevdepth.py](https://github.com/Arham-Tahir64/BEV-NN/blob/c932fb6/src/models/bevdepth.py).
+
+### Two result views from the newer model
+
+<figure>
+  <a href="/BEV-NN/images/bevdepth-results-view-1.png" aria-label="Open the first fuller-BEVDepth result screenshot at full resolution">
+    <img src="/BEV-NN/images/bevdepth-results-view-1.png" width="1545" height="776" loading="lazy" alt="First newer-model result: ground truth on the left and prediction on the right, with BEV and 3D views showing a road corridor and more localized vertical structures than in the earlier ray-smeared result." />
+  </a>
+  <figcaption>Result view 1 from the newer BEVDepth-style occupancy implementation. Ground truth is on the left and prediction on the right, within the same visible, non-ignore comparison region. <a href="/BEV-NN/images/bevdepth-results-view-1.png">Open the full-resolution screenshot</a>.</figcaption>
+</figure>
+
+<figure>
+  <a href="/BEV-NN/images/bevdepth-results-view-2.png" aria-label="Open the second fuller-BEVDepth result screenshot at full resolution">
+    <img src="/BEV-NN/images/bevdepth-results-view-2.png" width="1588" height="769" loading="lazy" alt="Second newer-model result: side-by-side ground-truth and predicted BEV and 3D occupancy, with recovered road, cars, vegetation and upright structures, alongside remaining semantic and extent errors." />
+  </a>
+  <figcaption>Result view 2 from the same implementation stage. The 3D view makes object height and remaining spatial errors easier to inspect than BEV alone. These are two result views, not a controlled before-and-after pair. <a href="/BEV-NN/images/bevdepth-results-view-2.png">Open the full-resolution screenshot</a>.</figcaption>
+</figure>
+
+### What looks better now
+
+**Ray smearing is much reduced.** Compared with the earlier visualization, occupied regions are more localized and the long radial streaks are less dominant. The reconstruction looks more like a scene with distinct structures rather than semantic colours extended along viewing directions.
+
+**Occupied-scene coverage is higher.** In playback, I’m seeing substantially more occupied structure being recovered. This is the improvement I mean when I say the occupancy percentage looks higher. Predicting more occupied voxels is not automatically more accurate, so I still need occupied precision, recall, and IoU on matched evaluation frames to quantify how much of that additional occupancy is correct. I’m not assigning a numerical percentage from these screenshots.
+
+**Object height looks better too.** The vertical extent of structures appears closer to the ground truth in the 3D comparison. The model retains all 16 height layers of the 0.4 m voxel grid. The viewer can exaggerate height for readability, so physical height comparisons need matching display settings and voxel-space measurements rather than screen height alone.
+
+These are visual observations from the newer model, not evidence that any one component caused the improvement. Image features, depth estimation, lifting, refinement, and the decoder changed together.
+
+### Distance is still the difficult case
+
+During playback, I still see ray smearing farther from the ego vehicle. As the car approaches those regions, the predictions become cleaner and the structures more localized. That is an observation across the moving sequence; these two still images alone do not establish the near-versus-far change.
+
+My working explanation is that distant objects occupy fewer image pixels and give the model less detail for resolving depth and boundaries. A depth distribution spread over several candidate distances can still distribute features along a ray. The current default depth grid uses 64 one-metre bins, which is another design choice to investigate alongside image resolution and depth-target quality. These are possible contributors, not a diagnosis established by the screenshots.
+
+The architecture is still single-frame: cleaner predictions as the car gets closer come from new camera observations at each frame, not from an implemented temporal memory. Occlusion and hidden surfaces also remain ambiguous even when the visible geometry looks better.
+
+The next useful comparison is distance-binned evaluation: near, middle, and far occupied precision/recall and IoU, together with depth errors where targets exist. I also want to inspect upper-height occupancy and follow the same scene regions as the vehicle approaches. That should show whether the cleaner playback corresponds to better geometry and help target the remaining distant smearing.
+
 
 ### References & project links
 
