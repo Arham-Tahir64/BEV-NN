@@ -44,6 +44,12 @@ No validation labels enter class-weight estimation or training.
 Do not initialize the larger official-split run from our mini baseline weights:
 that checkpoint already saw the two scenes which now belong to full validation.
 
+The command above reproduces the earlier residual-lifting baseline. New depth
+runs now default to corrected probability lifting. For the fresh 100-scene
+comparison, use the separate command and output directory in
+[LIFTING_FIX.md](LIFTING_FIX.md). Resuming an old checkpoint retains its saved
+lifting mode; it does not apply the correction to that run.
+
 The first pilot uses five epochs. After inspecting validation and the checkpoint,
 extend that existing run to 20 total epochs with:
 
@@ -79,3 +85,8 @@ the full 20-scene validation aggregate is a different evaluation set.
 - Official package and exact frame counts: https://github.com/CVPR2023-3D-Occupancy-Prediction/CVPR2023-3D-Occupancy-Prediction#download
 - FlashOcc's use of the compatible gts: https://github.com/Yzichen/FlashOCC/blob/master/doc/install.md
 - SurroundOcc format differences: https://github.com/weiyithu/SurroundOcc/blob/main/docs/data.md
+
+## BEVDepth camera-only architecture
+
+For the new architecture, its camera-only contract, measured GPU cost and a separate fresh-run command, see [BEVDEPTH_STRUCTURE.md](BEVDEPTH_STRUCTURE.md). Its recommended training command uses existing annotation-derived depth and requires no raw LiDAR.
+

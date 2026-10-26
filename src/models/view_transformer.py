@@ -22,8 +22,10 @@ class ViewTransformer(nn.Module):
         Voxel features [B, C, X, Y, Z], in the labels' [X, Y, Z] axis order.
         Residual depth fusion returns 2*C+1 channels (raw, gated, support).
         Gated depth fusion returns C+1 channels (gated, support).
-        Residual depth fusion returns [B, 2*C+1, X, Y, Z]: original context,
-        depth-weighted context, and scalar support, for a learned projection.
+        Probability fusion returns C+1 channels sampled jointly from image
+        features multiplied by D*p(depth), plus D*p(depth) support. It has no
+        raw appearance branch or probability clipping. A fixed global D
+        preserves uniform-depth feature scale without cancelling the gate.
 
     Default Occ3D grid:
         Shape: (200, 200, 16).
@@ -233,6 +235,41 @@ class ViewTransformer(nn.Module):
         support = support.reshape(b, n, -1)
         return support.masked_fill((depths < edges[0]) | (depths >= edges[-1]), 0)
 
+    def make_probability_volume(self, features, probabilities):
+        """Weight context BEFORE spatial interpolation; return [B*N,C+1,D,h,w].
+
+        Interpolating context and probability separately creates cross terms
+        between adjacent image rays: a foreground feature can borrow a
+        background pixel's depth. Joint interpolation retains their pairing.
+        D is a fixed global scale, not a per-voxel support normalization.
+        The small image frustum is materialized once, never [B,N,C,D,V].
+        """
+        b, n, c, h, w = features.shape
+        d = probabilities.shape[2]
+        # CUDA's trilinear grid sampler requires FP32 under mixed precision.
+        with torch.autocast(device_type=features.device.type, enabled=False):
+            support = probabilities.float().unsqueeze(2)
+            weighted = features.float().unsqueeze(3) * support
+            joint = torch.cat((weighted, support), dim=2) * d
+        return joint.reshape(b*n, c+1, d, h, w)
+
+    def sample_probability_volume(self, volume, pixels, depths, edges):
+        """Sample paired appearance/depth; preserve end bins and image bounds."""
+        b, n, v = depths.shape
+        _, channels, d, h, w = volume.shape
+        xy = 2 * (pixels.float() / 16 + .5) / pixels.new_tensor([w, h]).float() - 1
+        z = 2 * (depths.float() - edges[0]) / (edges[-1] - edges[0]) - 1
+        # Extend the first/last depth centres only to their own bin edges.
+        # Spatial padding stays zero; border padding would copy edge pixels.
+        z = z.clamp(min=-1 + 1/d, max=1 - 1/d)
+        grid = torch.cat((xy, z.unsqueeze(-1)), dim=-1).reshape(b*n, 1, v, 1, 3)
+        with torch.autocast(device_type=volume.device.type, enabled=False):
+            sampled = F.grid_sample(volume, grid, mode='bilinear',
+                                    padding_mode='zeros', align_corners=False)
+        sampled = sampled.reshape(b, n, channels, v)
+        outside_depth = (depths < edges[0]) | (depths >= edges[-1])
+        return sampled.masked_fill(outside_depth.unsqueeze(2), 0)
+
     def forward(
         self,
         features: torch.Tensor,
@@ -271,13 +308,14 @@ class ViewTransformer(nn.Module):
         if not (features.device == intrinsics.device == ego_to_camera.device):
             raise ValueError("Features and camera calibration must be on the same device.")
 
-        if depth_fusion not in ('legacy', 'residual', 'gated'):
+        if depth_fusion not in ('legacy', 'residual', 'gated', 'probability'):
             raise ValueError('Unknown depth fusion mode.')
-        if depth_fusion in ('residual', 'gated') and depth_probs is None:
+        if depth_fusion in ('residual', 'gated', 'probability') and depth_probs is None:
             raise ValueError('Depth fusion requires depth probabilities.')
 
         if depth_probs is not None:
             if (depth_probs.ndim != 5 or depth_probs.shape[:2] != (batch_size, cameras)
+                    or depth_probs.shape[2] <= 0
                     or depth_probs.shape[-2:] != (feature_height, feature_width)):
                 raise ValueError("depth_probs must be [B,6,D,h,w] matching image features.")
             if depth_edges is None or depth_edges.shape != (depth_probs.shape[2] + 1,):
@@ -297,6 +335,8 @@ class ViewTransformer(nn.Module):
         intrinsics = intrinsics.to(dtype=geometry_dtype)
         ego_to_camera = ego_to_camera.to(dtype=geometry_dtype)
 
+        probability_volume = (self.make_probability_volume(features, depth_probs)
+                              if depth_fusion == 'probability' else None)
         fused_chunks = []
         for centres in self.voxel_centres.split(self.voxel_chunk_size):
             # Avoid low-precision matrix products in the metric projection.
@@ -304,6 +344,16 @@ class ViewTransformer(nn.Module):
                 pixels, valid = self.project_voxels(
                     centres, intrinsics, ego_to_camera, image_size
                 )
+            if probability_volume is not None:
+                with torch.autocast(device_type=features.device.type, enabled=False):
+                    depths = torch.einsum("bnj,vj->bnv", ego_to_camera[..., 2, :3],
+                                          centres.to(geometry_dtype)) + ego_to_camera[..., 2, 3, None]
+                    sampled = self.sample_probability_volume(
+                        probability_volume, pixels, depths, depth_edges)
+                # Average by geometric camera counts, never by depth support.
+                # Keep the large voxel output in the context's original dtype.
+                fused_chunks.append(self.fuse_features(sampled, valid).to(features.dtype))
+                continue
             sampled = self.sample_features(features, pixels, image_size)
             context = self.fuse_features(sampled, valid) if depth_fusion == 'residual' else None
             if depth_probs is not None:
@@ -333,5 +383,5 @@ class ViewTransformer(nn.Module):
         # Concatenation preserves gradients and the original [X,Y,Z] order.
         fused = torch.cat(fused_chunks, dim=-1)  # [B,C,V]
         output_channels = {'legacy': channels, 'residual': 2*channels+1,
-                           'gated': channels+1}[depth_fusion]
+                           'gated': channels+1, 'probability': channels+1}[depth_fusion]
         return fused.reshape(batch_size, output_channels, *self.grid_shape)

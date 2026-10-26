@@ -1,10 +1,11 @@
-"""Approximate depth supervision from occupancy annotations, not measured depth.
+"""Depth supervision from occupancy annotations or measured LiDAR points.
 
 Legacy ray mode stops at unknown space using exact voxel traversal. Projected
 mode selects the nearest observed occupied voxel centre in each feature cell;
 it does not require an observed camera origin. Unknown gaps can conceal nearer
 surfaces, so projected targets are first annotated surfaces, not guaranteed
-physical first hits. Neither mode uses labels as model inputs at inference.
+physical first hits. LiDAR mode instead projects measured sensor points.
+All targets are training/evaluation supervision, never inference inputs.
 """
 from pathlib import Path
 import hashlib
@@ -127,9 +128,17 @@ class DepthTargetDataset(Dataset):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.min_depth, self.max_depth = min_depth, max_depth
-        if target_mode not in ('ray', 'projected'):
+        if target_mode not in ('ray', 'projected', 'lidar'):
             raise ValueError('Unknown depth target mode.')
         self.target_mode = target_mode
+        if target_mode == 'lidar':
+            missing = [r['sample_token'] for r in dataset.records
+                       if not r.get('lidar_path') or not Path(r['lidar_path']).is_file()]
+            if missing:
+                raise FileNotFoundError('Measured LiDAR depth requires official nuScenes metadata and '
+                    f'LIDAR_TOP keyframe files for every selected frame; missing {len(missing)}. '
+                    'The Occ3D annotations.json adapter has no LiDAR calibration. '
+                    'Use --depth-target-mode projected explicitly for approximate voxel targets.')
 
     def __getattr__(self, name):
         # Avoid recursive attribute lookup when DataLoader unpickles workers.
@@ -154,13 +163,18 @@ class DepthTargetDataset(Dataset):
             if observed.shape != arrays[0].shape or not np.isin(observed, [0, 1]).all():
                 raise ValueError('Invalid observed-space annotation mask.')
             observed = observed.astype(bool)
-        settings = ("dda-v1" if self.target_mode == 'ray' else 'projected-v2',
+        settings = ({'ray': 'dda-v1', 'projected': 'projected-v2', 'lidar': 'lidar-v1'}[self.target_mode],
                     self.image_size, self.voxel_bounds, self.min_depth, self.max_depth)
         digest = hashlib.sha256(json.dumps(settings).encode())
         for array in arrays:
             digest.update(array.tobytes())
         if observed is not None:
             digest.update(observed.tobytes())
+        if self.target_mode == 'lidar':
+            record = self.dataset.records[index]
+            lidar_bytes = Path(record['lidar_path']).read_bytes()
+            digest.update(lidar_bytes)
+            digest.update(record['lidar_to_ego'].tobytes())
         path = self.cache_dir / (digest.hexdigest()+".npy")
         if path.exists():
             depth = np.load(path, allow_pickle=False)
@@ -168,9 +182,16 @@ class DepthTargetDataset(Dataset):
             if self.target_mode == 'ray':
                 depth = first_surface_depth(*arrays, self.image_size, self.voxel_bounds,
                                             self.min_depth, self.max_depth)
-            else:
+            elif self.target_mode == 'projected':
                 depth = projected_surface_depth(arrays[0], observed, arrays[1], arrays[2], arrays[3],
                     self.image_size, self.voxel_bounds, self.min_depth, self.max_depth)
+            else:
+                from .lidar_depth import project_lidar_depth
+                points = np.frombuffer(lidar_bytes, dtype=np.float32)
+                if points.size % 5:
+                    raise ValueError('Invalid nuScenes LiDAR file: expected five float32 values per point.')
+                depth = project_lidar_depth(points.reshape(-1, 5), record['lidar_to_ego'],
+                    arrays[2], arrays[3], self.image_size, self.min_depth, self.max_depth)
             temporary = path.with_suffix(f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
             try:
                 with temporary.open("wb") as stream:
@@ -185,6 +206,8 @@ def depth_loss(logits, target, edges, mode='hard'):
     """Masked bin CE and valid count; no-target batches return differentiable zero."""
     if logits.ndim != 5 or target.shape != (logits.shape[0], logits.shape[1], *logits.shape[-2:]):
         raise ValueError("Depth logits/targets must be [B,N,D,h,w] / [B,N,h,w].")
+    if mode not in ('hard', 'linear', 'bce'):
+        raise ValueError('Unknown depth loss mode.')
     valid = torch.isfinite(target) & (target >= edges[0]) & (target < edges[-1])
     count = int(valid.sum().item())
     if not count:
@@ -194,6 +217,14 @@ def depth_loss(logits, target, edges, mode='hard'):
     selected = logits.permute(0, 1, 3, 4, 2)[valid].float()
     if mode == 'hard':
         return torch.nn.functional.cross_entropy(selected, labels), count
+    if mode == 'bce':
+        # BEVDepth supervises the softmax probabilities with one-hot BCE,
+        # summing bins and averaging over valid pixels. Weight 3 lives in the
+        # training configuration, not inside this reusable loss function.
+        with torch.autocast(device_type=selected.device.type, enabled=False):
+            expected = torch.nn.functional.one_hot(labels, logits.shape[2]).float()
+            return torch.nn.functional.binary_cross_entropy(
+                selected.softmax(-1), expected, reduction='none').sum(-1).mean(), count
     if mode != 'linear':
         raise ValueError('Unknown depth loss mode.')
     # Split supervision across neighbouring bin centres instead of making a

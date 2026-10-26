@@ -57,16 +57,21 @@ def parse_args() -> argparse.Namespace:
                         help="Add normalized XYZ positional features before the unchanged decoder.")
     parser.add_argument("--depth", action=argparse.BooleanOptionalAction, default=False,
                         help="Enable supervised depth-conditioned lifting (new runs).")
+    parser.add_argument('--architecture', choices=('baseline', 'bevdepth'), default='baseline',
+                        help='bevdepth enables camera-aware DepthNet, frustum refinement, forward pooling, '
+                             'a trainable image FPN and a multiscale voxel decoder.')
     parser.add_argument("--depth-bins", type=int, default=64)
     parser.add_argument("--depth-min", type=float, default=0.1)
     parser.add_argument("--depth-max", type=float, default=64.1)
-    parser.add_argument("--depth-loss-weight", type=float, default=1.0)
+    parser.add_argument("--depth-loss-weight", type=float, default=None)
     parser.add_argument("--depth-cache", type=Path,
                         default=Path(__file__).resolve().parent / "outputs" / "depth_cache")
-    parser.add_argument('--depth-target-mode', choices=('ray', 'projected'), default='projected')
-    parser.add_argument('--depth-fusion', choices=('legacy', 'residual', 'gated'), default='residual',
-                        help='gated tests scaled depth-dependent appearance without a raw context branch.')
-    parser.add_argument('--depth-loss-mode', choices=('hard', 'linear'), default='linear')
+    parser.add_argument('--depth-target-mode', choices=('ray', 'projected', 'lidar'), default='projected')
+    parser.add_argument('--depth-fusion', choices=('legacy', 'residual', 'gated', 'probability', 'bevdepth'),
+                        default=None,
+                        help='New --depth runs default to probability: joint probability-weighted lifting, '
+                             'no raw appearance bypass or clipping. Other modes reproduce older runs.')
+    parser.add_argument('--depth-loss-mode', choices=('hard', 'linear', 'bce'), default=None)
     parser.add_argument('--geometry-loss-weight', type=float, default=0.0,
                         help='Weight of unweighted occupied/free BCE on existing logits; 0 disables it.')
     parser.add_argument('--dataset-version', choices=('v1.0-mini','v1.0-trainval'), default='v1.0-mini')
@@ -80,8 +85,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--train-scenes', type=Path, help='JSON scene-name list within the official training split.')
     parser.add_argument('--val-scenes', type=Path, help='JSON scene-name list within the official validation split.')
     args = parser.parse_args()
-    if args.depth_fusion == 'gated' and not args.depth:
-        parser.error('--depth-fusion gated requires --depth.')
+    if args.depth_fusion is None:
+        args.depth_fusion = 'bevdepth' if args.architecture == 'bevdepth' else ('probability' if args.depth else 'legacy')
+    if args.depth_loss_mode is None:
+        args.depth_loss_mode = 'bce' if args.architecture == 'bevdepth' else 'linear'
+    if args.depth_loss_weight is None:
+        args.depth_loss_weight = 3.0 if args.architecture == 'bevdepth' else 1.0
+    if args.architecture == 'bevdepth' and (not args.depth or args.depth_fusion != 'bevdepth'):
+        parser.error('--architecture bevdepth requires --depth and --depth-fusion bevdepth.')
+    if args.architecture != 'bevdepth' and args.depth_fusion == 'bevdepth':
+        parser.error('--depth-fusion bevdepth requires --architecture bevdepth.')
+    if args.depth_fusion in ('gated', 'probability') and not args.depth:
+        parser.error(f'--depth-fusion {args.depth_fusion} requires --depth.')
     if (args.depth_bins <= 0 or not math.isfinite(args.depth_min)
             or not math.isfinite(args.depth_max) or not 0 < args.depth_min < args.depth_max):
         parser.error("Depth bins must be positive and bounds finite with 0 < min < max.")
@@ -487,6 +502,7 @@ def main() -> None:
         )
 
     model_config = {
+        "architecture": getattr(args, 'architecture', 'baseline'),
         "feature_channels": 32,
         "hidden_channels": 32,
         "num_classes": train_dataset.num_classes,
@@ -510,6 +526,11 @@ def main() -> None:
         print("Overfit check: training fit on a small subset; use held-out validation to assess generalization.")
     # Downloads ImageNet weights on first construction if not cached.
     model = OccupancyModel(**model_config).to(device)
+    if model_config['architecture'] == 'bevdepth':
+        print(f'BEVDepth occupancy adaptation: {args.depth_target_mode} depth targets, '
+              f'{args.depth_loss_mode} depth loss, weight {args.depth_loss_weight}.', flush=True)
+        if args.depth_target_mode != 'lidar':
+            print('Depth uses occupancy-derived pseudo-labels; this is not the paper\'s measured LiDAR supervision.', flush=True)
     optimizer = torch.optim.AdamW(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=args.lr, weight_decay=args.weight_decay,

@@ -141,6 +141,7 @@ class NuScenesOccupancyDataset(Dataset):
         from .scene_selection import split_scene_names
         from .occupancy_labels import DEFAULT_OCCUPANCY_ROOT
         from .voxel_projection import camera_geometry, occupancy_label_path
+        from .lidar_depth import lidar_record
 
         if len(image_size) != 2 or any(not isinstance(d, int) or isinstance(d, bool) or d <= 0 for d in image_size):
             raise ValueError("image_size must be two positive integers (height, width).")
@@ -188,6 +189,7 @@ class NuScenesOccupancyDataset(Dataset):
                     "image_paths": tuple(paths), "label_path": label_path,
                     "intrinsics": np.asarray(intrinsics, dtype=np.float32),
                     "ego_to_camera": np.asarray(transforms, dtype=np.float32),
+                    **lidar_record(nusc, sample),
                 })
                 token = sample["next"]
         if not self.records:

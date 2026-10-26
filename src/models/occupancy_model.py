@@ -50,24 +50,28 @@ class OccupancyModel(nn.Module):
         depth_min: float = 0.1,
         depth_max: float = 64.1,
         depth_fusion: str = 'legacy',
+        architecture: str = 'baseline',
     ) -> None:
         super().__init__()
-
-        # The encoder handles freezing its ResNet backbone internally.
-        self.image_encoder = ImageEncoder(
-            out_channels=feature_channels,
-            pretrained=pretrained,
-        )
-        self.view_transformer = ViewTransformer(
-            grid_shape=grid_shape,
-            voxel_bounds=voxel_bounds,
-            voxel_chunk_size=voxel_chunk_size,
-        )
-        self.occupancy_decoder = OccupancyDecoder(
-            in_channels=feature_channels,
-            hidden_channels=hidden_channels,
-            num_classes=num_classes,
-        )
+        if architecture not in ('baseline', 'bevdepth'):
+            raise ValueError('Unknown architecture.')
+        if architecture == 'bevdepth' and (not use_depth or depth_fusion != 'bevdepth'):
+            raise ValueError('BEVDepth architecture requires use_depth=True and depth_fusion=bevdepth.')
+        if architecture == 'baseline' and depth_fusion == 'bevdepth':
+            raise ValueError('BEVDepth fusion requires architecture=bevdepth.')
+        self.architecture = architecture
+        if architecture == 'bevdepth':
+            from .bevdepth import BEVDepthImageEncoder, FrustumVoxelPool, MultiScaleOccupancyDecoder
+            self.image_encoder = BEVDepthImageEncoder(pretrained=pretrained)
+            self.view_transformer = FrustumVoxelPool(grid_shape, voxel_bounds, channels=feature_channels)
+            self.occupancy_decoder = MultiScaleOccupancyDecoder(feature_channels, num_classes)
+        else:
+            # Preserve construction order and parameter names for old checkpoints.
+            self.image_encoder = ImageEncoder(out_channels=feature_channels, pretrained=pretrained)
+            self.view_transformer = ViewTransformer(grid_shape=grid_shape, voxel_bounds=voxel_bounds,
+                                                     voxel_chunk_size=voxel_chunk_size)
+            self.occupancy_decoder = OccupancyDecoder(in_channels=feature_channels,
+                                                       hidden_channels=hidden_channels, num_classes=num_classes)
 
         self.use_xyz = use_xyz
         if use_xyz:
@@ -89,12 +93,17 @@ class OccupancyModel(nn.Module):
             self.xyz_projection = None
 
         # Opt-in: old configurations retain identical parameters and outputs.
-        self.depth_head = DepthHead(num_bins=depth_bins, min_depth=depth_min,
-                                    max_depth=depth_max) if use_depth else None
-        if depth_fusion not in ('legacy', 'residual', 'gated'):
+        if architecture == 'bevdepth':
+            from .bevdepth import CameraAwareDepthNet
+            self.depth_head = CameraAwareDepthNet(context_channels=feature_channels, num_bins=depth_bins,
+                                                  min_depth=depth_min, max_depth=depth_max)
+        else:
+            self.depth_head = DepthHead(num_bins=depth_bins, min_depth=depth_min,
+                                        max_depth=depth_max) if use_depth else None
+        if depth_fusion not in ('legacy', 'residual', 'gated', 'probability', 'bevdepth'):
             raise ValueError('Unknown depth fusion mode.')
-        if depth_fusion == 'gated' and not use_depth:
-            raise ValueError('Gated fusion requires use_depth=True.')
+        if depth_fusion in ('gated', 'probability') and not use_depth:
+            raise ValueError(f'{depth_fusion.capitalize()} fusion requires use_depth=True.')
         self.depth_fusion = depth_fusion
         self.depth_context_projection = None
         if use_depth and depth_fusion == 'residual':
@@ -107,10 +116,12 @@ class OccupancyModel(nn.Module):
                 for c in range(feature_channels):
                     self.depth_context_projection.weight[c, c, 0, 0, 0] = .9
                     self.depth_context_projection.weight[c, c+feature_channels, 0, 0, 0] = .1
-        elif use_depth and depth_fusion == 'gated':
+        elif use_depth and depth_fusion in ('gated', 'probability'):
             self.depth_context_projection = nn.Conv3d(feature_channels+1, feature_channels, 1)
             # Identity on gated context; support starts with zero weight.
             # Uniform depth therefore preserves the original feature scale.
+            # Probability fusion changes lifting, not this projection's shape;
+            # saved depth_fusion selects the exact path on resume/inference.
             with torch.no_grad():
                 self.depth_context_projection.weight.zero_()
                 self.depth_context_projection.bias.zero_()
@@ -140,7 +151,10 @@ class OccupancyModel(nn.Module):
 
         image_size = tuple(images.shape[-2:])  # (H, W) of the resized input images.
         depth_logits = None
-        if self.depth_head is not None:
+        if self.architecture == 'bevdepth':
+            backbone = self.image_encoder(images)
+            depth_logits, image_features = self.depth_head(backbone, intrinsics, ego_to_camera, image_size)
+        elif self.depth_head is not None:
             image_features, backbone = self.image_encoder(images, return_backbone=True)
             depth_logits = self.depth_head(backbone)
         else:
@@ -150,9 +164,13 @@ class OccupancyModel(nn.Module):
             "depth_edges": self.depth_head.bin_edges,
             "depth_fusion": self.depth_fusion,
         }
-        voxel_features = self.view_transformer(
-            image_features, intrinsics, ego_to_camera, image_size, **depth_args
-        )  # [B,C,X,Y,Z]
+        if self.architecture == 'bevdepth':
+            voxel_features = self.view_transformer(image_features, depth_args['depth_probs'],
+                self.depth_head.bin_centres, intrinsics, ego_to_camera)
+        else:
+            voxel_features = self.view_transformer(
+                image_features, intrinsics, ego_to_camera, image_size, **depth_args
+            )  # [B,C,X,Y,Z]
         if self.depth_context_projection is not None:
             voxel_features = self.depth_context_projection(voxel_features)
         if self.xyz_projection is not None:
