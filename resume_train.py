@@ -124,7 +124,9 @@ def main():
                                     depth_loss_weight=settings.get('depth_loss_weight', 1.0),
                                     depth_loss_mode=settings.get('depth_loss_mode', 'hard'),
                                     geometry_loss_weight=settings.get('geometry_loss_weight', 0.0),
-                                    boundary_loss_weight=settings.get('boundary_loss_weight', 0.0))
+                                    boundary_loss_weight=settings.get('boundary_loss_weight', 0.0),
+                                    semantic_dice_weight=settings.get('semantic_dice_weight', 0.0),
+                                    bev_aux_weight=settings.get('bev_aux_weight', 0.0))
             val_stats = validate(model, val_loader, device, amp,
                 depth_loss_mode=settings.get('depth_loss_mode', 'hard')) if val_loader is not None else None
             loss = val_stats['loss'] if val_stats is not None else stats['loss']

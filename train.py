@@ -23,6 +23,7 @@ from src.models.occupancy_model import OccupancyModel
 from data.depth_targets import DepthTargetDataset, depth_loss
 from src.metrics import summarize_confusion, occupancy_boundary_counts, summarize_boundary_counts
 from src.losses import occupied_free_loss, boundary_occupied_free_loss
+from src.semantic_supervision import semantic_dice_loss, bev_auxiliary_loss
 from data.scene_selection import read_scene_list
 
 
@@ -78,6 +79,10 @@ def parse_args() -> argparse.Namespace:
                         help='Weight of unweighted occupied/free BCE on existing logits; 0 disables it.')
     parser.add_argument('--boundary-loss-weight', type=float, default=0.0,
                         help='Extra occupied/free BCE on observed six-neighbour boundary endpoints.')
+    parser.add_argument('--semantic-dice-weight', type=float, default=0.0,
+                        help='Macro soft Dice on target-present occupied classes; 0 disables it.')
+    parser.add_argument('--bev-aux-weight', type=float, default=0.0,
+                        help='Training-only BEV semantic CE head (bevdepth only); 0 disables it.')
     parser.add_argument('--dataset-version', choices=('v1.0-mini','v1.0-trainval'), default='v1.0-mini')
     parser.add_argument('--dataroot', type=Path, default=DEFAULT_DATAROOT,
                         help='nuScenes root containing the selected metadata version.')
@@ -112,6 +117,11 @@ def parse_args() -> argparse.Namespace:
         parser.error('--boundary-loss-weight must be finite and nonnegative.')
     if any(size <= 0 for size in args.image_size):
         parser.error('--image-size requires positive height and width.')
+    for name in ('semantic_dice_weight', 'bev_aux_weight'):
+        if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
+            parser.error(f'--{name.replace("_", "-")} must be finite and nonnegative.')
+    if args.bev_aux_weight > 0 and args.architecture != 'bevdepth':
+        parser.error('--bev-aux-weight requires --architecture bevdepth.')
 
     for name in ("epochs", "batch_size"):
         if getattr(args, name) <= 0:
@@ -210,6 +220,8 @@ def train_one_epoch(
     depth_loss_mode: str = 'hard',
     geometry_loss_weight: float = 0.0,
     boundary_loss_weight: float = 0.0,
+    semantic_dice_weight: float = 0.0,
+    bev_aux_weight: float = 0.0,
 ) -> dict[str, float]:
     """Update weights and average epoch loss by its target-weight denominator.
 
@@ -218,6 +230,11 @@ def train_one_epoch(
     RuntimeError rather than reporting a misleading zero loss.
     """
     model.train()  # ImageEncoder.train() keeps its frozen backbone in eval mode.
+    for name, weight in (('semantic_dice_weight', semantic_dice_weight), ('bev_aux_weight', bev_aux_weight)):
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError(f'{name} must be finite and nonnegative.')
+    if bev_aux_weight > 0 and getattr(model, 'bev_aux_head', None) is None:
+        raise ValueError('BEV auxiliary loss requires a model constructed with use_bev_aux=True.')
     if not math.isfinite(geometry_loss_weight) or geometry_loss_weight < 0:
         raise ValueError('geometry_loss_weight must be finite and nonnegative.')
     if not math.isfinite(boundary_loss_weight) or boundary_loss_weight < 0:
@@ -235,6 +252,8 @@ def train_one_epoch(
     geometry_count = 0
     boundary_sum = 0.0
     boundary_count = 0
+    dice_sum = bev_sum = 0.0
+    dice_count = bev_count = bev_possible = 0
 
     for batch_index, batch in enumerate(loader, start=1):
         images = batch["images"].to(device, non_blocking=True)
@@ -251,7 +270,7 @@ def train_one_epoch(
             continue
 
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-            if depth_enabled:
+            if depth_enabled or bev_aux_weight > 0:
                 auxiliary = model(images, intrinsics, ego_to_camera, return_aux=True)
                 logits = auxiliary["occupancy_logits"]
             else:
@@ -272,6 +291,23 @@ def train_one_epoch(
             geometry_sum += geometry.detach().item()*count
             geometry_count += count
             loss = loss + geometry_loss_weight*geometry
+
+        if semantic_dice_weight > 0:
+            dice, count = semantic_dice_loss(logits, semantics, valid_mask)
+            if not torch.isfinite(dice):
+                raise FloatingPointError('Non-finite semantic Dice loss.')
+            dice_sum += dice.detach().item()*count
+            dice_count += count
+            loss = loss + semantic_dice_weight*dice
+
+        if bev_aux_weight > 0:
+            bev, count = bev_auxiliary_loss(auxiliary['bev_logits'], semantics, valid_mask)
+            if not torch.isfinite(bev):
+                raise FloatingPointError('Non-finite BEV auxiliary loss.')
+            bev_sum += bev.detach().item()*count
+            bev_count += count
+            bev_possible += semantics.numel() // semantics.shape[-1]
+            loss = loss + bev_aux_weight*bev
 
         if boundary_loss_weight > 0:
             boundary, count = boundary_occupied_free_loss(logits, semantics, valid_mask)
@@ -319,8 +355,14 @@ def train_one_epoch(
         raise RuntimeError("Training epoch has no supervised voxels; check the data and visibility masks.")
     if depth_enabled and depth_count == 0:
         raise RuntimeError("No trustworthy depth targets in this epoch. Inspect target coverage before training.")
+    if bev_aux_weight > 0 and bev_count == 0:
+        raise RuntimeError('No trustworthy BEV targets in this epoch. Inspect visibility/height coverage.')
     return {
         "loss": total_loss / total_loss_weight,
+        **({'semantic_dice_loss': dice_sum/dice_count if dice_count else 0.0,
+            'semantic_dice_classes': dice_count} if semantic_dice_weight > 0 else {}),
+        **({'bev_aux_loss': bev_sum/bev_count, 'bev_aux_cells': bev_count,
+            'bev_aux_coverage': bev_count/bev_possible} if bev_aux_weight > 0 else {}),
         **({"depth_loss": depth_loss_sum / depth_count, "depth_targets": depth_count}
            if depth_enabled else {}),
         **({'geometry_loss': geometry_sum/geometry_count, 'geometry_voxels': geometry_count}
@@ -546,6 +588,7 @@ def main() -> None:
         "voxel_chunk_size": 65536,
         "use_xyz": args.xyz,
         "use_depth": args.depth,
+        "use_bev_aux": getattr(args, 'bev_aux_weight', 0.0) > 0,
         "depth_bins": args.depth_bins,
         "depth_min": args.depth_min,
         "depth_max": args.depth_max,
@@ -579,6 +622,10 @@ def main() -> None:
                      for key, value in vars(args).items()},
         "model": model_config,
         "loss": {
+            'semantic_dice_weight': getattr(args, 'semantic_dice_weight', 0.0),
+            'semantic_dice': 'Macro soft Dice over target-present occupied classes; observed free voxels penalize false positives.',
+            'bev_aux_weight': getattr(args, 'bev_aux_weight', 0.0),
+            'bev_aux': 'Unweighted topmost-surface semantic CE; unknown above surface excluded; free requires entire column known.',
             "class_balance": args.class_balance,
             "class_weights": class_weights.cpu().tolist() if class_weights is not None else None,
             "training_class_counts": class_counts.tolist() if class_counts is not None else None,
@@ -629,6 +676,8 @@ def main() -> None:
                 depth_loss_mode=args.depth_loss_mode,
                 geometry_loss_weight=args.geometry_loss_weight,
                 boundary_loss_weight=getattr(args, 'boundary_loss_weight', 0.0),
+                semantic_dice_weight=getattr(args, 'semantic_dice_weight', 0.0),
+                bev_aux_weight=getattr(args, 'bev_aux_weight', 0.0),
             )
             val_stats = (
                 validate(model, val_loader, device, amp_enabled, depth_loss_mode=args.depth_loss_mode)
@@ -664,6 +713,10 @@ def main() -> None:
                 summary += f", geometry_BCE={train_stats['geometry_loss']:.4f}"
             if 'boundary_loss' in train_stats:
                 summary += f", boundary_BCE={train_stats['boundary_loss']:.4f}"
+            if 'semantic_dice_loss' in train_stats:
+                summary += f", semantic_Dice={train_stats['semantic_dice_loss']:.4f}"
+            if 'bev_aux_loss' in train_stats:
+                summary += f", BEV_CE={train_stats['bev_aux_loss']:.4f}, BEV_coverage={train_stats['bev_aux_coverage']:.1%}"
             if val_stats is not None:
                 summary += f", val_loss={val_stats['loss']:.4f}, val_accuracy={val_stats['accuracy']:.3%}"
                 summary += (f", occ_mIoU={val_stats['occupied_class_miou']:.3%}, "

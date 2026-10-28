@@ -51,10 +51,13 @@ class OccupancyModel(nn.Module):
         depth_max: float = 64.1,
         depth_fusion: str = 'legacy',
         architecture: str = 'baseline',
+        use_bev_aux: bool = False,
     ) -> None:
         super().__init__()
         if architecture not in ('baseline', 'bevdepth'):
             raise ValueError('Unknown architecture.')
+        if use_bev_aux and architecture != 'bevdepth':
+            raise ValueError('BEV auxiliary supervision requires architecture=bevdepth.')
         if architecture == 'bevdepth' and (not use_depth or depth_fusion != 'bevdepth'):
             raise ValueError('BEVDepth architecture requires use_depth=True and depth_fusion=bevdepth.')
         if architecture == 'baseline' and depth_fusion == 'bevdepth':
@@ -129,6 +132,18 @@ class OccupancyModel(nn.Module):
                     self.depth_context_projection.weight[c, c, 0, 0, 0] = 1.
 
 
+        # Construct last to preserve all existing seeded model initializations.
+        # fork_rng also preserves the subsequent dropout/data RNG sequence.
+        self.use_bev_aux = bool(use_bev_aux)
+        self.bev_aux_head = None
+        if self.use_bev_aux:
+            with torch.random.fork_rng(devices=[]):
+                self.bev_aux_head = nn.Sequential(
+                    nn.Conv2d(feature_channels, feature_channels, 3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(feature_channels, num_classes, 1),
+                )
+
     def forward(
         self,
         images: torch.Tensor,
@@ -178,7 +193,16 @@ class OccupancyModel(nn.Module):
             # Zero initialization starts from the image-only baseline; training
             # learns how much each coordinate contributes to each channel.
             voxel_features = voxel_features + self.xyz_projection(self.voxel_coordinates)
-        logits = self.occupancy_decoder(voxel_features)
+        bev_logits = None
+        # No auxiliary operations in eval or the ordinary logits-only forward.
+        if self.use_bev_aux and self.training and return_aux:
+            logits, decoder_features = self.occupancy_decoder(voxel_features, return_features=True)
+            bev_logits = self.bev_aux_head(decoder_features.mean(dim=-1))
+        else:
+            logits = self.occupancy_decoder(voxel_features)
         if return_aux:
-            return {"occupancy_logits": logits, "depth_logits": depth_logits}
+            result = {"occupancy_logits": logits, "depth_logits": depth_logits}
+            if bev_logits is not None:
+                result['bev_logits'] = bev_logits
+            return result
         return logits

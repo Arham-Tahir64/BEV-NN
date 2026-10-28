@@ -258,11 +258,13 @@ class MultiScaleOccupancyDecoder(nn.Module):
         self.refine = Residual3D(channels)
         self.classifier = nn.Conv3d(channels, num_classes, 1)
 
-    def forward(self, x):
+    def forward(self, x, *, return_features=False):
         full = self.full(x)
         half = self.half_stage(full)
         quarter = self.quarter(half)
         merged = half + F.interpolate(self.up_half(quarter), size=half.shape[-3:], mode='trilinear', align_corners=False)
         merged = full + F.interpolate(self.up_full(merged), size=full.shape[-3:], mode='trilinear', align_corners=False)
-        return self.classifier(self.refine(merged))
+        features = self.refine(merged)
+        logits = self.classifier(features)
+        return (logits, features) if return_features else logits
 
