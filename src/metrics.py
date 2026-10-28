@@ -1,5 +1,30 @@
 """Global masked occupancy metrics; rows=true, columns=predicted."""
 import torch
+from .losses import observed_occupancy_boundary
+
+
+def occupancy_boundary_counts(prediction, semantics, valid_mask):
+    """Exact six-neighbour binary boundary overlap within observed space.
+
+    Counts matched, predicted and GT boundary voxels; sum across batches before
+    computing rates. Semantic instance identity is not evaluated.
+    """
+    known = valid_mask & (semantics >= 0) & (semantics <= 17)
+    truth = observed_occupancy_boundary(semantics, known)
+    predicted = observed_occupancy_boundary(prediction, known)
+    return torch.stack(((truth & predicted).sum(), predicted.sum(), truth.sum()))
+
+
+def summarize_boundary_counts(counts):
+    matched, predicted, truth = (int(v) for v in counts.detach().cpu().tolist())
+    return {'boundary_precision': matched / predicted if predicted else None,
+            'boundary_recall': matched / truth if truth else None,
+            'boundary_f1': 2*matched/(predicted+truth) if predicted+truth else None,
+            'boundary_matched_voxels': matched, 'boundary_predicted_voxels': predicted,
+            'boundary_gt_voxels': truth,
+            'boundary_metric_rule': 'Exact occupied/free boundary endpoint overlap; '
+                'six-neighbour adjacency; both neighbours visible and labelled; '
+                'no tolerance or exterior padding. Undefined rates are null.'}
 
 
 def summarize_confusion(matrix):

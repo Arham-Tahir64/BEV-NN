@@ -21,8 +21,8 @@ from data import DEFAULT_DATAROOT, NuScenesOccupancyDataset, make_dataloader, lo
 from data.nuscenes_dataset import IMAGE_MEAN, IMAGE_STD
 from src.models.occupancy_model import OccupancyModel
 from data.depth_targets import DepthTargetDataset, depth_loss
-from src.metrics import summarize_confusion
-from src.losses import occupied_free_loss
+from src.metrics import summarize_confusion, occupancy_boundary_counts, summarize_boundary_counts
+from src.losses import occupied_free_loss, boundary_occupied_free_loss
 from data.scene_selection import read_scene_list
 
 
@@ -37,6 +37,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.01,
                         help="AdamW weight decay (default: 0.01).")
     parser.add_argument("--batch-size", type=int, default=1, help="Samples per batch (default: 1).")
+    parser.add_argument('--image-size', type=int, nargs=2, metavar=('HEIGHT', 'WIDTH'),
+                        default=(320, 576), help='Camera input size; try 480 864 for finer image features.')
     parser.add_argument("--workers", type=int, default=0,
                         help="DataLoader workers; zero avoids Windows subprocesses (default: 0).")
     parser.add_argument("--seed", type=int, default=0, help="Nonnegative random seed (default: 0).")
@@ -74,6 +76,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--depth-loss-mode', choices=('hard', 'linear', 'bce'), default=None)
     parser.add_argument('--geometry-loss-weight', type=float, default=0.0,
                         help='Weight of unweighted occupied/free BCE on existing logits; 0 disables it.')
+    parser.add_argument('--boundary-loss-weight', type=float, default=0.0,
+                        help='Extra occupied/free BCE on observed six-neighbour boundary endpoints.')
     parser.add_argument('--dataset-version', choices=('v1.0-mini','v1.0-trainval'), default='v1.0-mini')
     parser.add_argument('--dataroot', type=Path, default=DEFAULT_DATAROOT,
                         help='nuScenes root containing the selected metadata version.')
@@ -104,6 +108,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--depth-loss-weight must be finite and positive.")
     if not math.isfinite(args.geometry_loss_weight) or args.geometry_loss_weight < 0:
         parser.error('--geometry-loss-weight must be finite and nonnegative.')
+    if not math.isfinite(args.boundary_loss_weight) or args.boundary_loss_weight < 0:
+        parser.error('--boundary-loss-weight must be finite and nonnegative.')
+    if any(size <= 0 for size in args.image_size):
+        parser.error('--image-size requires positive height and width.')
 
     for name in ("epochs", "batch_size"):
         if getattr(args, name) <= 0:
@@ -201,6 +209,7 @@ def train_one_epoch(
     depth_loss_weight: float = 1.0,
     depth_loss_mode: str = 'hard',
     geometry_loss_weight: float = 0.0,
+    boundary_loss_weight: float = 0.0,
 ) -> dict[str, float]:
     """Update weights and average epoch loss by its target-weight denominator.
 
@@ -211,6 +220,8 @@ def train_one_epoch(
     model.train()  # ImageEncoder.train() keeps its frozen backbone in eval mode.
     if not math.isfinite(geometry_loss_weight) or geometry_loss_weight < 0:
         raise ValueError('geometry_loss_weight must be finite and nonnegative.')
+    if not math.isfinite(boundary_loss_weight) or boundary_loss_weight < 0:
+        raise ValueError('boundary_loss_weight must be finite and nonnegative.')
     use_amp = amp_enabled and device.type == "cuda"
     total_loss = 0.0
     total_voxels = 0
@@ -222,6 +233,8 @@ def train_one_epoch(
     depth_count = 0
     geometry_sum = 0.0
     geometry_count = 0
+    boundary_sum = 0.0
+    boundary_count = 0
 
     for batch_index, batch in enumerate(loader, start=1):
         images = batch["images"].to(device, non_blocking=True)
@@ -259,6 +272,14 @@ def train_one_epoch(
             geometry_sum += geometry.detach().item()*count
             geometry_count += count
             loss = loss + geometry_loss_weight*geometry
+
+        if boundary_loss_weight > 0:
+            boundary, count = boundary_occupied_free_loss(logits, semantics, valid_mask)
+            if not torch.isfinite(boundary):
+                raise FloatingPointError('Non-finite occupied/free boundary loss.')
+            boundary_sum += boundary.detach().item()*count
+            boundary_count += count
+            loss = loss + boundary_loss_weight*boundary
 
         if depth_enabled:
             if "depth_target" not in batch:
@@ -304,6 +325,8 @@ def train_one_epoch(
            if depth_enabled else {}),
         **({'geometry_loss': geometry_sum/geometry_count, 'geometry_voxels': geometry_count}
            if geometry_count else {}),
+        **({'boundary_loss': boundary_sum/boundary_count if boundary_count else 0.0,
+            'boundary_voxels': boundary_count} if boundary_loss_weight > 0 else {}),
         "valid_voxels": total_voxels,
         "batches": processed_batches,
         "skipped_batches": skipped_batches,
@@ -326,6 +349,9 @@ def validate(
     processed_batches = 0
     skipped_batches = 0
     confusion = torch.zeros(18, 18, dtype=torch.int64, device=device)
+    boundary_counts = torch.zeros(3, dtype=torch.int64, device=device)
+    boundary_loss_sum = 0.0
+    boundary_loss_count = 0
     depth_sum = depth_abs = 0.0
     depth_count = depth_possible = 0
     range_counts = [0, 0, 0]
@@ -365,6 +391,10 @@ def validate(
             geometry_sum += geometry.item()*valid_voxels
             total_voxels += valid_voxels
             prediction = logits.argmax(dim=1)
+            boundary_counts += occupancy_boundary_counts(prediction, semantics, supervised)
+            boundary, boundary_n = boundary_occupied_free_loss(logits, semantics, supervised)
+            boundary_loss_sum += boundary.item()*boundary_n
+            boundary_loss_count += boundary_n
             correct_voxels += int(((prediction == semantics) & supervised).sum().item())
             confusion += torch.bincount(semantics[supervised]*18 + prediction[supervised],
                                         minlength=324).reshape(18, 18)
@@ -397,6 +427,9 @@ def validate(
         "accuracy": correct_voxels / total_voxels,
         'geometry_loss': geometry_sum/total_voxels,
         **summarize_confusion(confusion),
+        **summarize_boundary_counts(boundary_counts),
+        'boundary_loss': boundary_loss_sum/boundary_loss_count if boundary_loss_count else None,
+        'boundary_loss_voxels': boundary_loss_count,
         **({'depth_loss': depth_sum/depth_count if depth_count else None,
             'pseudo_depth_mae_m': depth_abs/depth_count if depth_count else None,
             'depth_targets': depth_count, 'depth_target_coverage': depth_count/depth_possible,
@@ -455,7 +488,8 @@ def main() -> None:
 
     dataset_options = dict(dataroot=args.dataroot, occupancy_root=args.occupancy_root,
                            version=args.dataset_version, image_root=args.image_root,
-                           annotations_json=args.annotations_json)
+                           annotations_json=args.annotations_json,
+                           image_size=tuple(getattr(args, 'image_size', (320, 576))))
     print(f'Indexing {args.dataset_version} training scenes...',flush=True)
     train_dataset = NuScenesOccupancyDataset(split="train", **dataset_options,
                                             scene_names=read_scene_list(args.train_scenes))
@@ -522,6 +556,8 @@ def main() -> None:
         f"Device: {device}; AMP: {amp_enabled}; training samples: {len(selected_dataset)}; "
         f"validation: {run_validation}"
     )
+    print(f'Image size: {train_dataset.image_size}; geometry BCE weight: {args.geometry_loss_weight}; '
+          f'boundary BCE weight: {getattr(args, "boundary_loss_weight", 0.0)}', flush=True)
     if args.overfit_samples > 0:
         print("Overfit check: training fit on a small subset; use held-out validation to assess generalization.")
     # Downloads ImageNet weights on first construction if not cached.
@@ -552,6 +588,9 @@ def main() -> None:
             "depth_loss_mode": args.depth_loss_mode,
             'geometry_loss_weight': args.geometry_loss_weight,
             'geometry_loss': 'Unweighted observed-voxel occupied/free BCE; free=17, unknown ignored.',
+            'boundary_loss_weight': getattr(args, 'boundary_loss_weight', 0.0),
+            'boundary_loss': 'Mean occupied/free BCE over both endpoints of observed six-neighbour '
+                             'occupied/free transitions; invisible/unknown neighbours excluded.',
         },
         "data": {
             "dataroot": str(args.dataroot.expanduser().resolve()),
@@ -589,6 +628,7 @@ def main() -> None:
                 depth_loss_weight=args.depth_loss_weight,
                 depth_loss_mode=args.depth_loss_mode,
                 geometry_loss_weight=args.geometry_loss_weight,
+                boundary_loss_weight=getattr(args, 'boundary_loss_weight', 0.0),
             )
             val_stats = (
                 validate(model, val_loader, device, amp_enabled, depth_loss_mode=args.depth_loss_mode)
@@ -622,6 +662,8 @@ def main() -> None:
             summary = f"Epoch {epoch}: train_loss={train_stats['loss']:.4f}"
             if 'geometry_loss' in train_stats:
                 summary += f", geometry_BCE={train_stats['geometry_loss']:.4f}"
+            if 'boundary_loss' in train_stats:
+                summary += f", boundary_BCE={train_stats['boundary_loss']:.4f}"
             if val_stats is not None:
                 summary += f", val_loss={val_stats['loss']:.4f}, val_accuracy={val_stats['accuracy']:.3%}"
                 summary += (f", occ_mIoU={val_stats['occupied_class_miou']:.3%}, "
@@ -629,6 +671,8 @@ def main() -> None:
                             f"occupied_P/R={val_stats['occupied_precision']:.3%}/{val_stats['occupied_recall']:.3%}")
                 if val_stats['missing_supported_classes']:
                     summary += f", MISSING_CLASS_IDS={val_stats['missing_supported_classes']}"
+                if val_stats.get('boundary_f1') is not None:
+                    summary += f", boundary_F1={val_stats['boundary_f1']:.3%}"
             print(summary)
 
     print(f"Finished. Logs and latest/best checkpoints: {args.output_dir}")

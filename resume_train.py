@@ -113,7 +113,7 @@ def main():
     best_semantic_miou = config['metrics'].get('best_semantic_miou', -1.0)
     weights = config.get('loss', {}).get('class_weights')
     weights = torch.tensor(weights, dtype=torch.float32, device=device) if weights is not None else None
-    config = {**config, 'training': {**settings, 'epochs': args.epochs},
+    config = {**config, 'training': {**settings, 'epochs': args.epochs, 'workers': args.workers},
               'device': str(device), 'amp_enabled': amp}
     print(f'Resuming epoch {start_epoch}/{args.epochs} on {device}; best loss={best_loss:.6f}', flush=True)
     print('Legacy checkpoint: random-number state was not saved; minibatch order may differ.', flush=True)
@@ -123,7 +123,8 @@ def main():
             stats = train_one_epoch(model, loader, optimizer, scaler, device, amp, weights,
                                     depth_loss_weight=settings.get('depth_loss_weight', 1.0),
                                     depth_loss_mode=settings.get('depth_loss_mode', 'hard'),
-                                    geometry_loss_weight=settings.get('geometry_loss_weight', 0.0))
+                                    geometry_loss_weight=settings.get('geometry_loss_weight', 0.0),
+                                    boundary_loss_weight=settings.get('boundary_loss_weight', 0.0))
             val_stats = validate(model, val_loader, device, amp,
                 depth_loss_mode=settings.get('depth_loss_mode', 'hard')) if val_loader is not None else None
             loss = val_stats['loss'] if val_stats is not None else stats['loss']
@@ -152,6 +153,8 @@ def main():
                 print(f"Occupied mIoU={val_stats['occupied_class_miou']:.3%}; "
                       f"manmade IoU={val_stats['manmade_iou']:.3%}; "
                       f"missing class IDs={val_stats['missing_supported_classes']}", flush=True)
+                print(f"Occupied precision/recall={val_stats['occupied_precision']:.3%}/"
+                      f"{val_stats['occupied_recall']:.3%}; boundary F1={val_stats.get('boundary_f1')}", flush=True)
 
 
 if __name__ == '__main__':
