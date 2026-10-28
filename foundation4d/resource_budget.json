@@ -1,0 +1,11 @@
+{
+  "status": "analytic_tensor_sizes_not_measured_model_memory",
+  "legacy_hidden_32channel_volume_mib": 39.0625,
+  "proposed_bev_state_mib": 1.220703125,
+  "dense_18class_output_mib": 21.97265625,
+  "samples_per_projector_layer": 960000,
+  "fully_materialized_sample_features_mib": 117.1875,
+  "one_camera_query_chunk_features_mib": 2.0,
+  "naive_global_bev_attention_4heads_fp32_mib": 1525.87890625,
+  "warning": "Totals exclude saved backward activations, encoder, optimizer, convolution workspaces and allocator overhead."
+}

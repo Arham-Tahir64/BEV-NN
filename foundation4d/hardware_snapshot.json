@@ -1,0 +1,12 @@
+{
+  "gpu": "NVIDIA GeForce RTX 4060",
+  "total_vram_mib": 8188,
+  "free_vram_mib_at_check": 3832,
+  "system_ram_gib": 31.84,
+  "available_ram_gib_at_check": 8.7,
+  "free_disk_gib_at_check": 259.14,
+  "python": "3.12",
+  "torch": "2.11.0",
+  "torchvision": "0.26.0",
+  "note": "Free resources are transient. No Foundation4D model was run."
+}

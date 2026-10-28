@@ -60,7 +60,7 @@ class SceneEngine:
         sys.path.insert(0, str(project_root.resolve()))
         import torch
         from data.nuscenes_dataset import NuScenesOccupancyDataset, load_nuscenes
-        from src.models.occupancy_model import OccupancyModel
+        from foundation4d.registry import build_model
         self.torch = torch
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         self.config = checkpoint["config"]
@@ -100,7 +100,7 @@ class SceneEngine:
                                    else "cpu" if device_name == "auto" else device_name)
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA was requested but is unavailable.")
-        self.model = OccupancyModel(**{**self.config["model"], "pretrained": False}).to(self.device)
+        self.model = build_model(self.config["model"]).to(self.device)
         self.model.load_state_dict(checkpoint["model_state_dict"], strict=True)
         self.model.eval()
         self.lock = threading.Lock()
@@ -243,7 +243,7 @@ def make_handler(engine, page, plotly_file):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project-root",type=Path,default=PROJECT_ROOT)
-    parser.add_argument("--checkpoint",type=Path,default=PROJECT_ROOT/"outputs/train_xyz_full/latest.pt")
+    parser.add_argument("--checkpoint",type=Path,default=PROJECT_ROOT/"foundation4d/outputs/lite_480_depth0_offset0_seed0/epoch_005.pt")
     parser.add_argument("--scene",default="scene-0103")
     parser.add_argument("--port",type=int,default=8767)
     parser.add_argument("--device",choices=["auto","cuda","cpu"],default="auto")

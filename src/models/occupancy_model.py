@@ -52,6 +52,7 @@ class OccupancyModel(nn.Module):
         depth_fusion: str = 'legacy',
         architecture: str = 'baseline',
         use_bev_aux: bool = False,
+        frustum_refinement: str = 'legacy',
     ) -> None:
         super().__init__()
         if architecture not in ('baseline', 'bevdepth'):
@@ -63,10 +64,15 @@ class OccupancyModel(nn.Module):
         if architecture == 'baseline' and depth_fusion == 'bevdepth':
             raise ValueError('BEVDepth fusion requires architecture=bevdepth.')
         self.architecture = architecture
+        if frustum_refinement not in ('legacy', 'supported'):
+            raise ValueError('Unknown frustum refinement mode.')
+        if frustum_refinement != 'legacy' and architecture != 'bevdepth':
+            raise ValueError('Supported frustum refinement requires architecture=bevdepth.')
         if architecture == 'bevdepth':
             from .bevdepth import BEVDepthImageEncoder, FrustumVoxelPool, MultiScaleOccupancyDecoder
             self.image_encoder = BEVDepthImageEncoder(pretrained=pretrained)
-            self.view_transformer = FrustumVoxelPool(grid_shape, voxel_bounds, channels=feature_channels)
+            self.view_transformer = FrustumVoxelPool(grid_shape, voxel_bounds, channels=feature_channels,
+                                                     refinement_mode=frustum_refinement)
             self.occupancy_decoder = MultiScaleOccupancyDecoder(feature_channels, num_classes)
         else:
             # Preserve construction order and parameter names for old checkpoints.

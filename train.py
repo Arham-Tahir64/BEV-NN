@@ -75,6 +75,10 @@ def parse_args() -> argparse.Namespace:
                         help='New --depth runs default to probability: joint probability-weighted lifting, '
                              'no raw appearance bypass or clipping. Other modes reproduce older runs.')
     parser.add_argument('--depth-loss-mode', choices=('hard', 'linear', 'bce'), default=None)
+    parser.add_argument('--depth-range-balance', action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument('--depth-range-cap', type=float, default=2.0,
+                        help='Maximum normalized per-target range weight (>=1).')
+    parser.add_argument('--frustum-refinement', choices=('legacy', 'supported'), default='legacy')
     parser.add_argument('--geometry-loss-weight', type=float, default=0.0,
                         help='Weight of unweighted occupied/free BCE on existing logits; 0 disables it.')
     parser.add_argument('--boundary-loss-weight', type=float, default=0.0,
@@ -94,6 +98,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--train-scenes', type=Path, help='JSON scene-name list within the official training split.')
     parser.add_argument('--val-scenes', type=Path, help='JSON scene-name list within the official validation split.')
     args = parser.parse_args()
+    if args.depth_range_balance and not args.depth:
+        parser.error('--depth-range-balance requires --depth.')
+    if not math.isfinite(args.depth_range_cap) or args.depth_range_cap < 1:
+        parser.error('--depth-range-cap must be finite and >=1.')
+    if args.frustum_refinement != 'legacy' and args.architecture != 'bevdepth':
+        parser.error('--frustum-refinement supported requires --architecture bevdepth.')
     if args.depth_fusion is None:
         args.depth_fusion = 'bevdepth' if args.architecture == 'bevdepth' else ('probability' if args.depth else 'legacy')
     if args.depth_loss_mode is None:
@@ -222,6 +232,8 @@ def train_one_epoch(
     boundary_loss_weight: float = 0.0,
     semantic_dice_weight: float = 0.0,
     bev_aux_weight: float = 0.0,
+    depth_range_balance: bool = False,
+    depth_range_cap: float = 2.0,
 ) -> dict[str, float]:
     """Update weights and average epoch loss by its target-weight denominator.
 
@@ -246,6 +258,11 @@ def train_one_epoch(
     processed_batches = 0
     skipped_batches = 0
     depth_enabled = getattr(model, "depth_head", None) is not None
+    if depth_range_balance and not depth_enabled:
+        raise ValueError('Range balancing requires a depth head.')
+    if not math.isfinite(depth_range_cap) or depth_range_cap < 1:
+        raise ValueError('Depth range cap must be finite and >=1.')
+    depth_range_counts = [0, 0, 0]
     depth_loss_sum = 0.0
     depth_count = 0
     geometry_sum = 0.0
@@ -321,7 +338,15 @@ def train_one_epoch(
             if "depth_target" not in batch:
                 raise ValueError("Depth training requires cached depth_target from DepthTargetDataset.")
             auxiliary_loss, count = depth_loss(auxiliary["depth_logits"],
-                batch["depth_target"].to(device), model.depth_head.bin_edges, mode=depth_loss_mode)
+                batch["depth_target"].to(device), model.depth_head.bin_edges, mode=depth_loss_mode,
+                range_balance=depth_range_balance, range_cap=depth_range_cap)
+            if depth_range_balance:
+                targets = batch['depth_target']
+                edges = model.depth_head.bin_edges
+                known = torch.isfinite(targets) & (targets >= edges[0].item()) & (targets < edges[-1].item())
+                groups = torch.bucketize(targets[known].contiguous(), targets.new_tensor([10., 20.]), right=True)
+                counts = torch.bincount(groups, minlength=3).tolist()
+                depth_range_counts = [a+b for a, b in zip(depth_range_counts, counts)]
             if not torch.isfinite(auxiliary_loss):
                 raise FloatingPointError("Non-finite depth loss.")
             depth_loss_sum += auxiliary_loss.detach().item() * count
@@ -359,6 +384,8 @@ def train_one_epoch(
         raise RuntimeError('No trustworthy BEV targets in this epoch. Inspect visibility/height coverage.')
     return {
         "loss": total_loss / total_loss_weight,
+        **({'depth_range_counts_0_10_20_plus': depth_range_counts,
+            'depth_range_cap': depth_range_cap} if depth_range_balance else {}),
         **({'semantic_dice_loss': dice_sum/dice_count if dice_count else 0.0,
             'semantic_dice_classes': dice_count} if semantic_dice_weight > 0 else {}),
         **({'bev_aux_loss': bev_sum/bev_count, 'bev_aux_cells': bev_count,
@@ -398,6 +425,8 @@ def validate(
     depth_count = depth_possible = 0
     range_counts = [0, 0, 0]
     range_abs = [0.0, 0.0, 0.0]
+    range_expected_abs = [0., 0., 0.]
+    range_mass_within2 = [0., 0., 0.]
     geometry_sum = 0.0
 
     with torch.no_grad():
@@ -450,11 +479,20 @@ def validate(
                 known = torch.isfinite(targets) & (targets >= edges[0]) & (targets < edges[-1])
                 depths = model.depth_head.bin_centres[auxiliary['depth_logits'].argmax(2)]
                 error = (depths-targets).abs()
+                # Independent diagnostics; validation loss remains unweighted.
+                selected = auxiliary['depth_logits'].permute(0, 1, 3, 4, 2)[known].float().softmax(-1)
+                observed = targets[known]
+                centres = model.depth_head.bin_centres.float()
+                expected_error = ((selected*centres).sum(-1)-observed).abs()
+                mass_within2 = (selected*((centres[None]-observed[:,None]).abs() <= 2)).sum(-1)
                 depth_abs += error[known].sum().item()
                 for ri, (lo, hi) in enumerate(((0, 10), (10, 20), (20, float('inf')))):
                     keep = known & (targets >= lo) & (targets < hi)
                     range_counts[ri] += int(keep.sum().item())
                     range_abs[ri] += error[keep].sum().item()
+                    selected_range = (observed >= lo) & (observed < hi)
+                    range_expected_abs[ri] += expected_error[selected_range].sum().item()
+                    range_mass_within2[ri] += mass_within2[selected_range].sum().item()
             processed_batches += 1
             if batch_index == 1 or batch_index % 10 == 0 or batch_index == len(loader):
                 print(
@@ -476,7 +514,9 @@ def validate(
             'pseudo_depth_mae_m': depth_abs/depth_count if depth_count else None,
             'depth_targets': depth_count, 'depth_target_coverage': depth_count/depth_possible,
             'depth_range_counts_0_10_20_plus': range_counts,
-            'depth_range_mae_m': [e/n if n else None for e, n in zip(range_abs, range_counts)]}
+            'depth_range_mae_m': [e/n if n else None for e, n in zip(range_abs, range_counts)],
+            'depth_range_expected_mae_m': [e/n if n else None for e, n in zip(range_expected_abs, range_counts)],
+            'depth_range_mass_within2m': [e/n if n else None for e, n in zip(range_mass_within2, range_counts)]}
            if depth_possible else {}),
         "valid_voxels": total_voxels,
         "batches": processed_batches,
@@ -579,6 +619,7 @@ def main() -> None:
 
     model_config = {
         "architecture": getattr(args, 'architecture', 'baseline'),
+        "frustum_refinement": getattr(args, 'frustum_refinement', 'legacy'),
         "feature_channels": 32,
         "hidden_channels": 32,
         "num_classes": train_dataset.num_classes,
@@ -633,6 +674,9 @@ def main() -> None:
             "depth_loss_weight": args.depth_loss_weight if args.depth else 0.0,
             "depth_targets": args.depth_target_mode,
             "depth_loss_mode": args.depth_loss_mode,
+            'depth_range_balance': getattr(args, 'depth_range_balance', False),
+            'depth_range_cap': getattr(args, 'depth_range_cap', 2.0),
+            'depth_range_rule': 'Per-batch capped inverse range frequency, mean-one weights; camera-Z boundaries 10 and 20 m. Validation remains unweighted.',
             'geometry_loss_weight': args.geometry_loss_weight,
             'geometry_loss': 'Unweighted observed-voxel occupied/free BCE; free=17, unknown ignored.',
             'boundary_loss_weight': getattr(args, 'boundary_loss_weight', 0.0),
@@ -674,6 +718,8 @@ def main() -> None:
                 model, train_loader, optimizer, scaler, device, amp_enabled, class_weights,
                 depth_loss_weight=args.depth_loss_weight,
                 depth_loss_mode=args.depth_loss_mode,
+                depth_range_balance=getattr(args, 'depth_range_balance', False),
+                depth_range_cap=getattr(args, 'depth_range_cap', 2.0),
                 geometry_loss_weight=args.geometry_loss_weight,
                 boundary_loss_weight=getattr(args, 'boundary_loss_weight', 0.0),
                 semantic_dice_weight=getattr(args, 'semantic_dice_weight', 0.0),

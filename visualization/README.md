@@ -1,4 +1,5 @@
-The scene player runs the existing trained checkpoint through a complete scene.
+The scene player defaults to the Dice run’s best validation-mIoU checkpoint:
+`outputs/semantic_bev_dice_seed0/best_semantic.pt`. It runs inference through a complete scene.
 It shows the six camera images, ground truth and predicted BEV, and rotatable 3D
 occupancy. It does not train or change the model or decoder.
 
@@ -87,8 +88,19 @@ Generate the full-split evaluation or refresh the interactive exports:
 ```
 
 For scene-0916 use `--scene scene-0916`; for another checkpoint use
-`--checkpoint PATH`. The player and standalone exports default to the epoch-100 checkpoint in
-`outputs/train_xyz_full/latest.pt`; evaluate_run.py compares best.pt and latest.pt.
+`--checkpoint PATH`. The live player uses the Dice checkpoint above. The standalone
+export tools still use saved results from `train_xyz_full`; they do not automatically
+regenerate predictions when the live checkpoint changes. `evaluate_run.py` remains
+the legacy best/latest comparison tool.
+
+Single-frame Dice evaluation (held-out validation frame):
+
+```powershell
+.\.venv\Scripts\python.exe evaluate.py --split val --sample-index 0
+```
+
+Restart an already-running scene player to load the new default checkpoint.
+Explicit `--checkpoint PATH` overrides remain supported.
 
 If the ignored Plotly runtime needs reinstalling:
 

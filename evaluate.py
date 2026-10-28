@@ -188,7 +188,7 @@ def save_camera_comparison(prediction, target, valid, record, camera_order, imag
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", type=Path, default=Path(__file__).resolve().parent / "outputs/overfit/best.pt")
+    parser.add_argument("--checkpoint", type=Path, default=Path(__file__).resolve().parent / "outputs/semantic_bev_dice_seed0/best_semantic.pt")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--split", choices=("train","val"), default="train")
     selection = parser.add_mutually_exclusive_group()

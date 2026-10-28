@@ -182,16 +182,47 @@ class FrustumRefinement(nn.Module):
         return torch.cat(values).reshape(b, n, h, c, d, w).permute(0, 1, 3, 4, 2, 5)
 
 
+class SupportedFrustumRefinement(FrustumRefinement):
+    """Raw context*p plus a zero-initialized, depth-supported residual.
+
+    The gate sums +/-1 bins, then normalizes over depth. It never fills a
+    disconnected zero-support region. Broad learned depth still remains broad.
+    """
+    def __init__(self, channels, row_chunk=16):
+        super().__init__(channels, row_chunk)
+        self.gain = nn.Parameter(torch.zeros(()))
+
+    @staticmethod
+    def support_gate(probabilities):
+        b, n, d, h, w = probabilities.shape
+        with torch.autocast(device_type=probabilities.device.type, enabled=False):
+            p = probabilities.float().reshape(b*n, 1, d, h, w)
+            gate = F.avg_pool3d(p, (3, 1, 1), stride=1, padding=(1, 0, 0))*3
+            gate = gate/gate.sum(2, keepdim=True).clamp_min(1e-12)
+        return gate.reshape(b, n, d, h, w)
+
+    def forward(self, volume, probabilities):
+        refined = super().forward(volume)
+        gate = self.support_gate(probabilities).unsqueeze(2)
+        return volume + self.gain.tanh()*gate*refined
+
+
 class FrustumVoxelPool(nn.Module):
     """Forward unprojection and sum pooling; all occupancy height cells survive."""
-    def __init__(self, grid_shape, voxel_bounds, channels=32, refine=True):
+    def __init__(self, grid_shape, voxel_bounds, channels=32, refine=True, refinement_mode='legacy'):
         super().__init__()
         from .view_transformer import ViewTransformer
         geometry = ViewTransformer(grid_shape=grid_shape, voxel_bounds=voxel_bounds)
         self.grid_shape = tuple(grid_shape)
         self.voxel_bounds = tuple(voxel_bounds)
         self.register_buffer('voxel_centres', geometry.voxel_centres)
-        self.refinement = FrustumRefinement(channels) if refine else nn.Identity()
+        if refinement_mode not in ('legacy', 'supported'):
+            raise ValueError('Unknown frustum refinement mode.')
+        if refinement_mode == 'supported' and not refine:
+            raise ValueError('Supported refinement requires refine=True.')
+        self.refinement_mode = refinement_mode
+        refinement_class = SupportedFrustumRefinement if refinement_mode == 'supported' else FrustumRefinement
+        self.refinement = refinement_class(channels) if refine else nn.Identity()
 
     def forward(self, context, probabilities, depths, intrinsics, ego_to_camera):
         b, n, c, h, w = context.shape
@@ -201,7 +232,8 @@ class FrustumVoxelPool(nn.Module):
             # BEVDepth's outer product. No D multiplier, clipping, raw branch,
             # division by depth support, or inverse projection of every voxel.
             volume = context.float().unsqueeze(3) * probabilities.float().unsqueeze(2)
-        volume = self.refinement(volume)
+        volume = (self.refinement(volume, probabilities) if self.refinement_mode == 'supported'
+                  else self.refinement(volume))
         with torch.no_grad(), torch.autocast(device_type=context.device.type, enabled=False):
             yy, xx = torch.meshgrid(torch.arange(h, device=context.device),
                                     torch.arange(w, device=context.device), indexing='ij')

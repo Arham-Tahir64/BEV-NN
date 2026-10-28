@@ -123,6 +123,8 @@ def main():
             stats = train_one_epoch(model, loader, optimizer, scaler, device, amp, weights,
                                     depth_loss_weight=settings.get('depth_loss_weight', 1.0),
                                     depth_loss_mode=settings.get('depth_loss_mode', 'hard'),
+                                    depth_range_balance=settings.get('depth_range_balance', False),
+                                    depth_range_cap=settings.get('depth_range_cap', 2.0),
                                     geometry_loss_weight=settings.get('geometry_loss_weight', 0.0),
                                     boundary_loss_weight=settings.get('boundary_loss_weight', 0.0),
                                     semantic_dice_weight=settings.get('semantic_dice_weight', 0.0),

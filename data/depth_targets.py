@@ -202,7 +202,32 @@ class DepthTargetDataset(Dataset):
         return {**item, "depth_target": torch.from_numpy(depth.copy())}
 
 
-def depth_loss(logits, target, edges, mode='hard'):
+def depth_range_weights(values, cap=2.0):
+    """Mean-one inverse-frequency weights for [0,10), [10,20), [20,inf).
+
+    Solve the capped weights jointly: every sample weight is <= cap even AFTER
+    normalization. Absent ranges receive no weight; only observed targets enter.
+    """
+    import math
+    if not math.isfinite(cap) or cap < 1:
+        raise ValueError('Depth range cap must be finite and >= 1.')
+    groups = torch.bucketize(values.contiguous(), values.new_tensor([10., 20.]), right=True)
+    counts = torch.bincount(groups, minlength=3).cpu().tolist()
+    if not values.numel():
+        return torch.ones_like(values)
+    low, high = 0., max(counts)*cap
+    for _ in range(50):
+        scale = (low+high)/2
+        total = sum(min(scale/n, cap)*n for n in counts if n)
+        if total < values.numel():
+            low = scale
+        else:
+            high = scale
+    weights = values.new_tensor([min(high/n, cap) if n else 0 for n in counts])
+    return weights[groups]
+
+
+def depth_loss(logits, target, edges, mode='hard', *, range_balance=False, range_cap=2.0):
     """Masked bin CE and valid count; no-target batches return differentiable zero."""
     if logits.ndim != 5 or target.shape != (logits.shape[0], logits.shape[1], *logits.shape[-2:]):
         raise ValueError("Depth logits/targets must be [B,N,D,h,w] / [B,N,h,w].")
@@ -215,16 +240,21 @@ def depth_loss(logits, target, edges, mode='hard'):
     # Internal boundaries belong to the following bin; max edge is excluded.
     labels = torch.bucketize(target[valid].contiguous(), edges[1:-1], right=True)
     selected = logits.permute(0, 1, 3, 4, 2)[valid].float()
+    def reduce(values):
+        if not range_balance:
+            return values.mean()
+        weights = depth_range_weights(target[valid].float(), range_cap)
+        return (values*weights).sum()/weights.sum()
     if mode == 'hard':
-        return torch.nn.functional.cross_entropy(selected, labels), count
+        return reduce(torch.nn.functional.cross_entropy(selected, labels, reduction='none')), count
     if mode == 'bce':
         # BEVDepth supervises the softmax probabilities with one-hot BCE,
         # summing bins and averaging over valid pixels. Weight 3 lives in the
         # training configuration, not inside this reusable loss function.
         with torch.autocast(device_type=selected.device.type, enabled=False):
             expected = torch.nn.functional.one_hot(labels, logits.shape[2]).float()
-            return torch.nn.functional.binary_cross_entropy(
-                selected.softmax(-1), expected, reduction='none').sum(-1).mean(), count
+            return reduce(torch.nn.functional.binary_cross_entropy(
+                selected.softmax(-1), expected, reduction='none').sum(-1)), count
     if mode != 'linear':
         raise ValueError('Unknown depth loss mode.')
     # Split supervision across neighbouring bin centres instead of making a
@@ -236,4 +266,4 @@ def depth_loss(logits, target, edges, mode='hard'):
     logp = selected.log_softmax(-1)
     loss = -(1-fraction)*logp.gather(1, left[:, None]).squeeze(1)
     loss -= fraction*logp.gather(1, right[:, None]).squeeze(1)
-    return loss.mean(), count
+    return reduce(loss), count

@@ -1,0 +1,23 @@
+[
+  {
+    "title": "NVIDIA Foundation4D official project",
+    "url": "https://research.nvidia.com/labs/sil/projects/foundation4d/",
+    "verified": "Paper and dataset links; no code or weights link visible at check."
+  },
+  {
+    "title": "Foundation4D paper v1",
+    "url": "https://arxiv.org/html/2610.30340v1",
+    "sections": [
+      "3.3",
+      "3.6",
+      "4.3",
+      "7.5.2"
+    ],
+    "verified": "Architecture, training schedule/hardware and inference Table 17."
+  },
+  {
+    "title": "NVIDIA PAI-Foundation4D dataset card",
+    "url": "https://huggingface.co/datasets/nvidia/PhysicalAI-Autonomous-Vehicles-Foundation4D",
+    "verified": "Annotation dataset release; not a model checkpoint."
+  }
+]

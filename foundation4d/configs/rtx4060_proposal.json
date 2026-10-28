@@ -1,0 +1,100 @@
+{
+  "name": "foundation4d_lite_rtx4060",
+  "status": "implemented_single_frame_baseline",
+  "training_hardware": {
+    "gpu": "RTX 4060",
+    "vram_gib": 8,
+    "batch_size": 1,
+    "precision": "fp16_amp",
+    "training_allocated_target_gib": 6,
+    "training_reserved_target_gib": 7
+  },
+  "inputs": {
+    "cameras": 6,
+    "initial_image_hw": [
+      320,
+      576
+    ],
+    "quality_image_hw": [
+      480,
+      864
+    ],
+    "timestamps": 1,
+    "calibration": "known"
+  },
+  "encoder": {
+    "name": "resnet18_multiscale",
+    "initialization": "imagenet",
+    "feature_width": 64,
+    "feature_stride": 16
+  },
+  "bev_projector": {
+    "type": "calibrated_pillar_sampling",
+    "bev_hw": [
+      100,
+      100
+    ],
+    "channels": 64,
+    "pillar_heights": 4,
+    "samples_per_height_per_camera": 4,
+    "layers": 2,
+    "camera_chunk_size": 1,
+    "query_chunk_size": 1024,
+    "global_attention": false,
+    "depth_prior": false
+  },
+  "output": {
+    "grid_xyz": [
+      200,
+      200,
+      16
+    ],
+    "bounds_xyz": [
+      -40,
+      -40,
+      -1,
+      40,
+      40,
+      5.4
+    ],
+    "occupied_classes": 17,
+    "free_class": 17,
+    "ignore_class": 255,
+    "binary_channels": 16,
+    "semantic_channels": 272
+  },
+  "loss": {
+    "binary_bce": 1,
+    "semantic_ce_occupied_only": 1,
+    "optional_dice_initial": 0,
+    "optional_bev_initial": 0,
+    "depth_auxiliary_initial": 0,
+    "boundary_auxiliary_initial": 0,
+    "unknown_voxels": "excluded"
+  },
+  "temporal_stage": {
+    "enabled_initially": false,
+    "history_frames": 1,
+    "history_bev_detached": true,
+    "past_only": true
+  },
+  "data": {
+    "provider": "existing_occ3d_train100_val20",
+    "copy_dataset": false,
+    "dense_targets_required": true
+  },
+  "checkpointing": {
+    "latest": true,
+    "best_semantic": true,
+    "best_binary_iou": true,
+    "best_boundary_f1": true,
+    "retain_every_epoch": true
+  },
+  "training_schedule": {
+    "initial_control_epochs": 8,
+    "optimizer": "adamw",
+    "initial_learning_rate": 0.0001,
+    "schedule": "constant_for_matched_control",
+    "seed": 0
+  }
+}
