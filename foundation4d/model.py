@@ -42,17 +42,19 @@ class ImageEncoder(nn.Module):
         self.stem.eval()
         return self
 
-    def forward(self, images):
+    def forward(self, images, return_fine=False):
         b,n,_,height,width = images.shape
         h,w = (height+15)//16,(width+15)//16
         x = self.stem(images.flatten(0,1)); aligned = []
         yy,xx = torch.meshgrid(torch.arange(h,device=x.device),torch.arange(w,device=x.device),indexing='ij')
         for stage,lateral,stride in zip(self.stages,self.lateral,(4,8,16,32)):
             x=stage(x);value=lateral(x)
+            if stride==8:fine=value.reshape(b,n,16,*value.shape[-2:])
             grid=torch.stack((2*(xx.float()*16/stride+.5)/value.shape[-1]-1,
                               2*(yy.float()*16/stride+.5)/value.shape[-2]-1),-1)
             aligned.append(F.grid_sample(value,grid[None].expand(b*n,-1,-1,-1).to(value.dtype),align_corners=False))
-        return self.fusion(torch.cat(aligned,1)).reshape(b,n,-1,h,w)
+        coarse=self.fusion(torch.cat(aligned,1)).reshape(b,n,-1,h,w)
+        return (coarse,fine) if return_fine else coarse
 
 
 def project_points(points, intrinsics, ego_to_camera, image_hw):
@@ -141,7 +143,7 @@ class Foundation4DLite(nn.Module):
     def __init__(self, channels=64, bev_shape=(100,100), grid_shape=(200,200,16),
                  voxel_bounds=(-40.,-40.,-1.,40.,40.,5.4), pillar_heights=4,
                  samples=4, query_chunk=1024, layers=2, learned_offsets=False,
-                 use_depth=False, depth_bins=64, threshold=.5, pretrained=True):
+                 use_depth=False, depth_bins=64, threshold=.5, pretrained=True, geometry_aware=False):
         super().__init__()
         if (len(grid_shape)!=3 or len(bev_shape)!=2 or any(v<=0 for v in (*grid_shape,*bev_shape))
                 or channels<8 or channels%8 or not 0<threshold<1 or layers<1 or query_chunk<1 or pillar_heights<1):
@@ -149,8 +151,14 @@ class Foundation4DLite(nn.Module):
         if len(voxel_bounds)!=6 or any(not math.isfinite(v) for v in voxel_bounds) or any(voxel_bounds[i]>=voxel_bounds[i+3] for i in range(3)):
             raise ValueError('Voxel bounds must be finite increasing XYZ limits.')
         self.grid_shape=tuple(grid_shape);self.voxel_bounds=tuple(voxel_bounds);self.threshold=threshold
+        self.geometry_aware=geometry_aware
+        if geometry_aware:
+            from .geometry import GeometryProjector
+            use_depth=True
+            pillar_heights=max(8,pillar_heights)
         self.encoder=ImageEncoder(channels,pretrained)
-        self.projectors=nn.ModuleList([PillarProjector(channels,bev_shape,voxel_bounds,pillar_heights,samples,
+        projector_type=GeometryProjector if geometry_aware else PillarProjector
+        self.projectors=nn.ModuleList([projector_type(channels,bev_shape,voxel_bounds,pillar_heights,samples,
                                                      query_chunk,learned_offsets) for _ in range(layers)])
         self.refiners=nn.ModuleList([Residual(channels) for _ in range(layers)])
         self.decoder=nn.Sequential(block(channels,channels),Residual(channels))
@@ -173,15 +181,23 @@ class Foundation4DLite(nn.Module):
             ego_to_camera=ego_to_camera.clone()
             ego_to_camera[...,:3,:3]=torch.where(camera_mask[:,:,None,None],ego_to_camera[...,:3,:3],torch.zeros_like(ego_to_camera[...,:3,:3]))
             ego_to_camera[...,2,3]=torch.where(camera_mask,ego_to_camera[...,2,3],ego_to_camera.new_full((),-1e6))
-        features=self.encoder(images);bev=None
+        if self.geometry_aware:
+            features,fine=self.encoder(images,return_fine=True)
+            depth=self.depth_head(features.flatten(0,1)).reshape(b,n,-1,*features.shape[-2:])
+        else:features=self.encoder(images);depth=None
+        bev=None
         for projector,refine in zip(self.projectors,self.refiners):
             previous=None if bev is None else bev.flatten(2).transpose(1,2)
-            projected=projector(features,intrinsics,ego_to_camera,images.shape[-2:],previous)
+            if self.geometry_aware:
+                projected=projector(features,intrinsics,ego_to_camera,images.shape[-2:],previous,
+                                    depth_logits=depth,fine=fine,edges=self.depth_edges)
+            else:projected=projector(features,intrinsics,ego_to_camera,images.shape[-2:],previous)
             bev=refine(projected if bev is None else bev+projected)
         decoded=self.decoder(F.interpolate(bev,size=self.grid_shape[:2],mode='bilinear',align_corners=False))
         binary=self.binary_head(decoded).permute(0,2,3,1)
         semantic=self.semantic_head(decoded).reshape(b,17,self.grid_shape[2],*self.grid_shape[:2]).permute(0,1,3,4,2)
-        depth=None if self.depth_head is None else self.depth_head(features.flatten(0,1)).reshape(b,n,-1,*features.shape[-2:])
+        if not self.geometry_aware:
+            depth=None if self.depth_head is None else self.depth_head(features.flatten(0,1)).reshape(b,n,-1,*features.shape[-2:])
         return {'binary_logits':binary,'semantic_logits':semantic,'depth_logits':depth}
 
     @staticmethod

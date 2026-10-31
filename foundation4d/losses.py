@@ -3,6 +3,25 @@ import torch
 from torch.nn import functional as F
 
 
+def height_weights(counts, cap=1.5):
+    counts=torch.as_tensor(counts,dtype=torch.float32)
+    if counts.ndim!=2 or counts.shape[1]!=2 or not torch.isfinite(counts).all() or (counts<0).any() or not 1<=cap<float('inf'):
+        raise ValueError('Expected nonnegative [Z,2] counts and finite cap >=1.')
+    positive,negative=counts[:,0],counts[:,1]
+    ratio=(negative/positive.clamp_min(1)).clamp(min=1,max=cap)
+    norm=(positive*ratio+negative)/(positive+negative).clamp_min(1)
+    norm=torch.where(counts.sum(1)>0,norm,torch.ones_like(norm))
+    return ratio,norm
+
+
+def balanced_binary(logits,labels,valid,ratio,norm):
+    known=valid&(labels!=255);positive=labels!=17
+    if not known.any():return logits.sum()*0
+    weight=torch.where(positive,ratio[None,None,None,:],torch.ones_like(ratio)[None,None,None,:])/norm[None,None,None,:]
+    loss=F.binary_cross_entropy_with_logits(logits.float(),positive.float(),reduction='none')
+    return (loss*weight)[known].mean()
+
+
 def occupancy_losses(heads, labels, valid_mask, class_weights=None):
     binary=heads['binary_logits'];semantic=heads['semantic_logits']
     if binary.shape!=labels.shape or semantic.shape!=(labels.shape[0],17,*labels.shape[1:]) or valid_mask.shape!=labels.shape:
@@ -35,3 +54,49 @@ def observed_occupancy_boundary(labels, valid):
         edge=known[a]&known[b]&(occupied[a]!=occupied[b])
         boundary[a]|=edge;boundary[b]|=edge
     return boundary
+
+
+def boundary_binary_loss(logits,labels,valid):
+    boundary=observed_occupancy_boundary(labels,valid)
+    if not boundary.any():return logits.sum()*0
+    return F.binary_cross_entropy_with_logits(logits[boundary].float(),(labels[boundary]!=17).float())
+
+
+def observed_ray_loss(logits,labels,valid,intrinsics,transforms,bounds,image_hw,max_voxels=8192):
+    """Reweight observed ray samples only; never manufacture free/occluded labels.
+
+    Within each stride-16 image cell select nearest sampled annotated surfaces
+    and explicitly labelled free samples before them. These are annotation-based
+    groups, not physical first-hit or visibility claims. No behind-hit carving.
+    """
+    from .model import project_points
+    terms=[]
+    for b in range(labels.shape[0]):
+        known=valid[b]&(labels[b]!=255)
+        index=known.nonzero()
+        if not len(index):continue
+        if len(index)>max_voxels:
+            index=index[torch.linspace(0,len(index)-1,max_voxels,device=index.device).long()]
+        truth=labels[b][tuple(index.T)];occupied=truth!=17
+        scale=logits.new_tensor([(bounds[i+3]-bounds[i])/labels.shape[i+1] for i in range(3)])
+        points=(index.float()+.5)*scale+logits.new_tensor(bounds[:3])
+        uv,visible=project_points(points[:,None],intrinsics[b:b+1],transforms[b:b+1],image_hw)
+        camera=torch.einsum('nij,qj->nqi',transforms[b,...,:3,:3].float(),points.float())+transforms[b,...,:3,3].float()[:,None]
+        fh,fw=(image_hw[0]+15)//16,(image_hw[1]+15)//16
+        selection=torch.zeros(len(index),device=index.device,dtype=torch.bool)
+        for n in range(intrinsics.shape[1]):
+            good=visible[0,n,:,0];pixel=uv[0,n,:,0]
+            ids=((pixel[:,1]/16).floor().long()*fw+(pixel[:,0]/16).floor().long()).clamp(0,fh*fw-1)
+            z=camera[n,:,2]
+            nearest=z.new_full((fh*fw,),float('inf'))
+            hits=good&occupied
+            nearest.scatter_reduce_(0,ids[hits],z[hits],reduce='amin',include_self=True)
+            depth=nearest[ids];has_hit=torch.isfinite(depth)
+            selection|=good&has_hit&((occupied&((z-depth).abs()<=.4))|(~occupied&(z<depth-.4)))
+        if selection.any():
+            values=logits[b][tuple(index[selection].T)].float();target=occupied[selection].float()
+            # Equal group contribution when both known surfaces and free samples exist.
+            for positive in (True,False):
+                keep=target.bool()==positive
+                if keep.any():terms.append(F.binary_cross_entropy_with_logits(values[keep],target[keep]))
+    return torch.stack(terms).mean() if terms else logits.sum()*0

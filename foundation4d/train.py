@@ -6,7 +6,8 @@ import shutil
 from pathlib import Path
 import torch
 from .model import Foundation4DLite
-from .data_adapter import metadata_from_config,make_dataset,training_class_weights
+from .data_adapter import metadata_from_config,make_dataset,training_class_weights,training_height_counts
+from .losses import height_weights
 from .runtime import seed_all,loader,run_epoch,build_model,atomic_save,rng_state,restore_rng,dataset_signature
 
 
@@ -27,7 +28,11 @@ def parse_args():
                    help='Sampling execution chunk (fresh default 1024); may be overridden on resume without changing weights.')
     p.add_argument('--learned-offsets',action='store_true')
     p.add_argument('--depth-weight',type=float,default=0.)
+    p.add_argument('--geometry-aware',action='store_true')
+    p.add_argument('--boundary-weight',type=float,default=0.)
+    p.add_argument('--ray-weight',type=float,default=0.)
     p.add_argument('--binary-weight',type=float,default=1.)
+    p.add_argument('--height-balance-cap',type=float,default=0.,help='0 disables; >=1 enables training-only normalized per-height positive BCE weights.')
     p.add_argument('--semantic-weight',type=float,default=1.)
     p.add_argument('--lr',type=float,default=1e-4)
     p.add_argument('--weight-decay',type=float,default=.01)
@@ -39,11 +44,18 @@ def parse_args():
     p.add_argument('--pretrained',action=argparse.BooleanOptionalAction,default=True)
     p.add_argument('--class-balance',choices=['sqrt-inverse','none'],default='sqrt-inverse')
     p.add_argument('--overfit-samples',type=int,default=0)
+    p.add_argument('--overfit-eval-train',action='store_true',help='Debug only: evaluate the selected training samples themselves.')
+    p.add_argument('--retain-every',type=int,default=1,help='Retain numbered checkpoints every N epochs; latest and best are still saved.')
     p.add_argument('--val-samples',type=int,default=0,help='0 evaluates full validation; bounded runs marked in metadata.')
     p.add_argument('--max-train-batches',type=int,default=0)
     p.add_argument('--allocated-limit-gib',type=float,default=6.)
     p.add_argument('--reserved-limit-gib',type=float,default=7.)
     a=p.parse_args()
+    if a.geometry_aware and a.depth_weight<=0:p.error('--geometry-aware requires positive --depth-weight.')
+    if any(not math.isfinite(v) or v<0 for v in (a.boundary_weight,a.ray_weight)):p.error('Auxiliary weights must be finite nonnegative.')
+    if a.overfit_eval_train and a.overfit_samples<1:p.error('--overfit-eval-train requires --overfit-samples >0.')
+    if a.retain_every<1:p.error('--retain-every must be positive.')
+    if not math.isfinite(a.height_balance_cap) or (a.height_balance_cap!=0 and a.height_balance_cap<1):p.error('height-balance-cap must be 0 or finite >=1.')
     for key in ('epochs','channels','layers','batch_size'):
         if getattr(a,key)<1:p.error(f'{key} must be positive.')
     if a.query_chunk is not None and a.query_chunk<1:p.error('query_chunk must be positive.')
@@ -83,10 +95,11 @@ def main():
         model_config=dict(architecture='foundation4d_lite',channels=a.channels,bev_shape=a.bev_shape,
             grid_shape=[200,200,16],voxel_bounds=[-40.,-40.,-1.,40.,40.,5.4],samples=a.samples,
             query_chunk=a.query_chunk,layers=a.layers,learned_offsets=a.learned_offsets,use_depth=a.depth_weight>0,
-            threshold=.5,pretrained=a.pretrained)
+            threshold=.5,pretrained=a.pretrained,geometry_aware=a.geometry_aware)
         config={'model':model_config,'data':metadata,'scope':'bounded_debug' if a.overfit_samples or a.val_samples or a.max_train_batches else 'full_train100_val20',
                 'loss':{'binary_weight':a.binary_weight,'semantic_weight':a.semantic_weight,'depth_weight':a.depth_weight,
-                        'semantic_rule':'Known occupied voxels only; free=17, ignore=255.', 'validation':'Unweighted BCE plus occupied-only semantic CE; threshold .5.'}}
+                        'boundary_weight':a.boundary_weight,'ray_weight':a.ray_weight,
+                        'semantic_rule':'Known occupied voxels only; free=17, ignore=255.', 'validation':'Unweighted BCE plus occupied-only semantic CE plus enabled depth loss; threshold .5.'}}
     else:
         metadata=config['data'];model_config=config['model']
         if a.epochs<=checkpoint['epoch']:print('Target epoch already completed; no changes.');return
@@ -97,7 +110,11 @@ def main():
         raise RuntimeError('Less than 5 GiB disk headroom; every epoch retains optimizer state.')
     out.mkdir(parents=True,exist_ok=True)
     train=make_dataset(metadata,'train',root,limit=a.overfit_samples,depth=a.depth_weight>0,depth_cache=out/'depth_cache')
-    val=make_dataset(metadata,'val',root,limit=a.val_samples,depth=a.depth_weight>0,depth_cache=out/'depth_cache')
+    if getattr(a,'overfit_eval_train',False):
+        val=train
+        config['scope']='overfit_train_evaluation_NOT_HELD_OUT'
+    else:
+        val=make_dataset(metadata,'val',root,limit=a.val_samples,depth=a.depth_weight>0,depth_cache=out/'depth_cache')
     signatures={key:dataset_signature(ds) for key,ds in [('train',train),('val',val)]}
     if checkpoint and signatures!=config['data_signatures']:raise ValueError('Dataset record selection changed.')
     config['data_signatures']=signatures
@@ -120,6 +137,19 @@ def main():
         config['loss']['class_counts']=counts.tolist() if counts is not None else None
         best={'loss':float('inf'),'semantic':-1.,'iou':-1.,'boundary':-1.};start=1
     if weights is not None:weights=weights.to(device)
+    cap=getattr(a,'height_balance_cap',0.)
+    binary_height_weights=None
+    if cap:
+        if checkpoint:
+            saved=config['loss']['height_balance']
+            ratio=torch.tensor(saved['positive_weights']);normalizer=torch.tensor(saved['normalizers'])
+        else:
+            height_counts=training_height_counts(train)
+            ratio,normalizer=height_weights(height_counts,cap)
+            config['loss']['height_balance']={'cap':cap,'counts':height_counts.tolist(),
+                'positive_weights':ratio.tolist(),'normalizers':normalizer.tolist(),
+                'rule':'Training only; known voxels; expected per-height sample weight normalized to 1.'}
+        binary_height_weights=(ratio.to(device),normalizer.to(device))
     args_dict={k:str(v) if isinstance(v,Path) else v for k,v in vars(a).items()}
     (out/'config.json').write_text(json.dumps({**config,'training':args_dict},indent=2))
     print(f'Foundation4D-Lite: {len(train)} train / {len(val)} val; {device}; {config["scope"]}; {sum(p.numel() for p in model.parameters()):,} parameters',flush=True)
@@ -128,7 +158,8 @@ def main():
         if device.type=='cuda':torch.cuda.reset_peak_memory_stats(device)
         training=run_epoch(model,loader(train,a.batch_size,a.workers,True,a.seed+epoch,device.type=='cuda'),device,
             optimizer=optimizer,scaler=scaler,amp=a.amp,class_weights=weights,
-            binary_weight=a.binary_weight,semantic_weight=a.semantic_weight,depth_weight=a.depth_weight,max_batches=a.max_train_batches)
+            binary_weight=a.binary_weight,semantic_weight=a.semantic_weight,depth_weight=a.depth_weight,max_batches=a.max_train_batches,
+            binary_height_weights=binary_height_weights,boundary_weight=getattr(a,'boundary_weight',0.),ray_weight=getattr(a,'ray_weight',0.))
         validation=run_epoch(model,loader(val,a.batch_size,a.workers,False,a.seed,device.type=='cuda'),device,amp=a.amp,
             binary_weight=a.binary_weight,semantic_weight=a.semantic_weight,depth_weight=a.depth_weight)
         allocated=torch.cuda.max_memory_allocated(device)/2**30 if device.type=='cuda' else None
@@ -141,12 +172,16 @@ def main():
         config['metrics']={'best_loss':best['loss'],'best_semantic_miou':best['semantic'],'best_binary_iou':best['iou'],'best_boundary_f1':best['boundary']}
         payload=dict(epoch=epoch,config=config,run_args=args_dict,model_state_dict=model.state_dict(),optimizer_state_dict=optimizer.state_dict(),
                      scaler_state_dict=scaler.state_dict(),rng_state=rng_state(),best=dict(best))
-        atomic_save(out/f'epoch_{epoch:03d}.pt',payload);atomic_save(out/'latest.pt',payload)
+        if epoch%getattr(a,'retain_every',1)==0 or epoch==a.epochs:
+            atomic_save(out/f'epoch_{epoch:03d}.pt',payload)
+        atomic_save(out/'latest.pt',payload)
         for key,filename in [('loss','best.pt'),('semantic','best_semantic.pt'),('iou','best_iou.pt'),('boundary','best_boundary.pt')]:
             if improved[key]:atomic_save(out/filename,payload)
         record=dict(epoch=epoch,train=training,validation=validation,peak_allocated_gib=allocated,peak_reserved_gib=reserved,best=dict(best),scope=config['scope'])
         with (out/'metrics.jsonl').open('a',encoding='utf-8') as stream:stream.write(json.dumps(record)+'\n')
         print(f'Epoch {epoch}: val_loss={validation["loss"]:.4f}, IoU={values["iou"]:.3%}, mIoU={values["semantic"]:.3%}, boundary_F1={values["boundary"]:.3%}, allocated_GiB={allocated}',flush=True)
+        upper=validation['range_metrics']['above1m']
+        print(f'Above 1 m: IoU={upper["binary_occupied_iou"]:.3%}, precision={upper["occupied_precision"]:.3%}, recall={upper["occupied_recall"]:.3%}',flush=True)
         if allocated is not None and a.allocated_limit_gib and allocated>a.allocated_limit_gib:
             raise RuntimeError('Memory budget exceeded; checkpoint saved. Lower model settings in a new run.')
         if reserved is not None and getattr(a,'reserved_limit_gib',7.) and reserved>getattr(a,'reserved_limit_gib',7.):

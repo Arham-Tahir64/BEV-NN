@@ -243,7 +243,7 @@ def make_handler(engine, page, plotly_file):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project-root",type=Path,default=PROJECT_ROOT)
-    parser.add_argument("--checkpoint",type=Path,default=PROJECT_ROOT/"foundation4d/outputs/lite_480_depth0_offset0_seed0/epoch_005.pt")
+    parser.add_argument("--checkpoint",type=Path,default=PROJECT_ROOT/"foundation4d/outputs/lite_480_geometry_seed0/epoch_009.pt")
     parser.add_argument("--scene",default="scene-0103")
     parser.add_argument("--port",type=int,default=8767)
     parser.add_argument("--device",choices=["auto","cuda","cpu"],default="auto")

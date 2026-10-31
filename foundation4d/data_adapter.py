@@ -52,3 +52,16 @@ def training_class_weights(dataset):
     weights[present]=counts[present].float().rsqrt()
     weights[present]/=weights[present].mean()
     return weights,counts
+
+
+def training_height_counts(dataset):
+    source=dataset.dataset if isinstance(dataset,Subset) else dataset
+    indices=dataset.indices if isinstance(dataset,Subset) else range(len(dataset))
+    counts=None
+    for i in indices:
+        with np.load(source.records[i]['label_path'],allow_pickle=False) as archive:
+            y=archive['semantics'];known=archive['mask_camera'].astype(bool)&(y!=255)
+            row=np.stack([(known&(y<17)).sum((0,1)),(known&(y==17)).sum((0,1))],-1)
+            counts=row if counts is None else counts+row
+    if counts is None:raise ValueError('Empty training dataset.')
+    return torch.from_numpy(counts)

@@ -1,5 +1,19 @@
 # nuScenes mini loader
 
+## 3D semantic occupancy visualization
+
+![Ground truth and camera-only 3D semantic occupancy prediction](docs/images/occupancy-comparison-height-balanced-e8.png)
+
+Ground truth (left) and predictions (right) from the lightweight height-balanced
+model at epoch 8, on validation scene `scene-0103`. Both panels show the same
+camera-visible, non-ignore voxel region. Colors represent semantic classes.
+This full-training result illustrates remaining missing occupied surfaces and
+ray smearing; it is not the single-frame overfit demonstration.
+
+The [lightweight implementation](foundation4d/README.md) and
+[geometry-aware variant](foundation4d/GEOMETRY.md) document the architecture and
+subsequent reconstruction improvements.
+
 ## Development blog
 
 Follow the architecture decisions and experiments at
