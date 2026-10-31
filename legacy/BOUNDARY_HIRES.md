@@ -43,7 +43,7 @@ the command below creates the intended new experiment.
 From `C:\Users\Arham\Desktop\BEV-NN`:
 
 ```powershell
-.\train_boundary_hires.ps1
+.\legacy\train_boundary_hires.ps1
 ```
 
 Equivalent command:

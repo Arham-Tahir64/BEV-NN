@@ -9,10 +9,10 @@ of Foundation4D. Accuracy improvements are hypotheses until held-out evaluation.
 From the project root, run each variant separately:
 
 ```powershell
-.\train_semantic_bev.ps1 -Variant baseline -Epochs 5
-.\train_semantic_bev.ps1 -Variant dice -Epochs 5
-.\train_semantic_bev.ps1 -Variant bev -Epochs 5
-.\train_semantic_bev.ps1 -Variant both -Epochs 5
+.\legacy\train_semantic_bev.ps1 -Variant baseline -Epochs 5
+.\legacy\train_semantic_bev.ps1 -Variant dice -Epochs 5
+.\legacy\train_semantic_bev.ps1 -Variant bev -Epochs 5
+.\legacy\train_semantic_bev.ps1 -Variant both -Epochs 5
 ```
 
 Default variant is `dice`, the lowest-cost first experiment. The launcher preserves

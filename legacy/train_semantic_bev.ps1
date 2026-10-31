@@ -1,25 +1,25 @@
 param(
-    [ValidateSet('baseline', 'range', 'support', 'both')][string]$Variant = 'both',
-    [ValidateRange(1, 10000)][int]$Epochs = 8,
+    [ValidateSet('baseline', 'dice', 'bev', 'both')][string]$Variant = 'dice',
+    [ValidateRange(1, 10000)][int]$Epochs = 5,
     [ValidateRange(0, 64)][int]$Workers = 2,
-    [ValidateRange(0, 2147483647)][int]$Seed = 0,
-    [ValidateRange(0, 10)][double]$DiceWeight = 0
+    [ValidateRange(0, 2147483647)][int]$Seed = 0
 )
 $ErrorActionPreference = 'Stop'
-Push-Location $PSScriptRoot
+$legacyProjectRoot = Split-Path $PSScriptRoot -Parent
+Push-Location $legacyProjectRoot
 try {
-    $experimentOutput = Join-Path $PSScriptRoot "outputs\depth_support_${Variant}_dice${DiceWeight}_seed${Seed}"
+    $experimentOutput = Join-Path $legacyProjectRoot "outputs\semantic_bev_${Variant}_seed${Seed}"
     if (Test-Path -LiteralPath $experimentOutput) {
         throw "Output already exists. Resume its latest.pt instead of overwriting: $experimentOutput"
     }
-    $refinement = if ($Variant -in @('support', 'both')) { 'supported' } else { 'legacy' }
+    $diceWeight = if ($Variant -in @('dice', 'both')) { '0.2' } else { '0' }
+    $bevWeight = if ($Variant -in @('bev', 'both')) { '0.1' } else { '0' }
     $trainingArgs = @(
         '-u', 'train.py', '--architecture', 'bevdepth', '--depth', '--xyz',
         '--image-size', '480', '864', '--geometry-loss-weight', '0.2',
         '--boundary-loss-weight', '0.1', '--depth-target-mode', 'projected',
         '--depth-loss-mode', 'bce', '--depth-loss-weight', '3',
-        '--semantic-dice-weight', $DiceWeight.ToString([System.Globalization.CultureInfo]::InvariantCulture),
-        '--frustum-refinement', $refinement, '--depth-range-cap', '2',
+        '--semantic-dice-weight', $diceWeight, '--bev-aux-weight', $bevWeight,
         '--dataset-version', 'v1.0-trainval', '--dataroot', 'data/occ3d_trainval',
         '--annotations-json', 'data/occ3d_trainval/downloads/annotations.json',
         '--occupancy-root', 'data/occ3d_trainval/gts',
@@ -29,8 +29,7 @@ try {
         '--batch-size', '1', '--workers', "$Workers", '--seed', "$Seed",
         '--output-dir', $experimentOutput
     )
-    if ($Variant -in @('range', 'both')) { $trainingArgs += '--depth-range-balance' }
-    $experimentPython = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
+    $experimentPython = Join-Path $legacyProjectRoot '.venv\Scripts\python.exe'
     if (-not (Test-Path -LiteralPath $experimentPython)) { $experimentPython = 'python' }
     & $experimentPython @trainingArgs
     if ($LASTEXITCODE -ne 0) { throw "Training exited with code $LASTEXITCODE" }

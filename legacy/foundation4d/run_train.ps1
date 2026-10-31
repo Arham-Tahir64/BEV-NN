@@ -9,7 +9,7 @@ param(
     [string]$OutputDir=''
 )
 $ErrorActionPreference='Stop'
-$projectRoot=Split-Path $PSScriptRoot -Parent
+$projectRoot=Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 Push-Location $projectRoot
 try {
     $imageWidth=if($ImageHeight -eq 320){576}else{864}

@@ -7,9 +7,9 @@ ray-smearing audit. Improvements in accuracy or visual quality remain hypotheses
 
 ```powershell
 cd C:\Users\Arham\Desktop\BEV-NN
-.\train_depth_support.ps1 -Variant range -Epochs 8
-.\train_depth_support.ps1 -Variant support -Epochs 8
-.\train_depth_support.ps1 -Variant both -Epochs 8
+.\legacy\train_depth_support.ps1 -Variant range -Epochs 8
+.\legacy\train_depth_support.ps1 -Variant support -Epochs 8
+.\legacy\train_depth_support.ps1 -Variant both -Epochs 8
 ```
 
 Use `-Variant baseline` for a matched control. Default is `both`. Each variant

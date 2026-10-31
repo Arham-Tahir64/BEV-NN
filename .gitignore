@@ -4,3 +4,10 @@ __pycache__/
 /data/*
 !/data/*.py
 /outputs/
+/tmp/
+/output/
+/torchinductor_*/
+/camera_frames.png
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/

@@ -1,7 +1,8 @@
 $ErrorActionPreference = 'Stop'
-Push-Location $PSScriptRoot
+$legacyProjectRoot = Split-Path $PSScriptRoot -Parent
+Push-Location $legacyProjectRoot
 try {
-    $experimentOutput = Join-Path $PSScriptRoot 'outputs\train_bevdepth_boundary_hires_train100'
+    $experimentOutput = Join-Path $legacyProjectRoot 'outputs\train_bevdepth_boundary_hires_train100'
     if (Test-Path -LiteralPath $experimentOutput) {
         throw "Output already exists. Resume its latest.pt instead of overwriting: $experimentOutput"
     }
